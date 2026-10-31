@@ -166,3 +166,11 @@ aside{height:calc(100vh - 36px)}
 .wtile .big{font-size:24px}
 .wgrid .wallets{flex:1;overflow:auto;align-content:start}
 .split{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;font-size:13px}
+
+/* ---- only the page content scrolls ---- */
+html,body{overflow:hidden}
+.body{overflow:hidden}
+.app{height:100%;min-height:0}
+aside{height:100%;position:static}
+main{overflow-y:auto}
+.gate{height:100%;overflow-y:auto}
