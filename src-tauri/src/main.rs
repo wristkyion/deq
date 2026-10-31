@@ -81,6 +81,12 @@ fn migrate(c: &Connection) -> R<()> {
             CREATE INDEX te_start ON time_entries(start_ts);
             PRAGMA user_version = 1; COMMIT;").map_err(e)?;
     }
+    if v < 2 {
+        c.execute_batch("BEGIN;
+            ALTER TABLE tx ADD COLUMN category TEXT;
+            ALTER TABLE tx ADD COLUMN is_transfer INTEGER NOT NULL DEFAULT 0;
+            PRAGMA user_version = 2; COMMIT;").map_err(e)?;
+    }
     Ok(())
 }
 /// Opens the active profile's encrypted personal.db (SQLCipher raw key).
@@ -209,8 +215,9 @@ fn add_account(a: State<App>, name: String, kind: String, opening_cents: i64) ->
     db(&a)?.execute("INSERT INTO accounts(name,kind,opening_cents) VALUES(?1,?2,?3)", params![name, kind, opening_cents]).map_err(e)?; Ok(())
 }
 #[tauri::command]
-fn add_tx(a: State<App>, account_id: i64, amount_cents: i64, note: String, at: i64) -> R<()> {
-    db(&a)?.execute("INSERT INTO tx(account_id,amount_cents,note,at) VALUES(?1,?2,?3,?4)", params![account_id, amount_cents, note, at]).map_err(e)?; Ok(())
+fn add_tx(a: State<App>, account_id: i64, amount_cents: i64, note: String, at: i64, category: Option<String>) -> R<()> {
+    let cat = category.map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
+    db(&a)?.execute("INSERT INTO tx(account_id,amount_cents,note,at,category) VALUES(?1,?2,?3,?4,?5)", params![account_id, amount_cents, note, at, cat]).map_err(e)?; Ok(())
 }
 #[tauri::command]
 fn list_accounts(a: State<App>) -> R<Vec<Acc>> {
@@ -233,15 +240,15 @@ fn stats(a: State<App>, week_start: i64) -> R<Stats> {
     Ok(Stats { balance_cents, week })
 }
 
-#[derive(Serialize)] struct TxRow { id: i64, account: String, amount_cents: i64, note: String, at: i64 }
+#[derive(Serialize)] struct TxRow { id: i64, account: String, amount_cents: i64, note: String, at: i64, category: String, transfer: bool }
 #[derive(Serialize)] struct TimeRow { id: i64, project: String, start: i64, end: i64 }
 #[derive(Serialize)] struct Summary { spent_cents: i64, income_cents: i64 }
 
 #[tauri::command]
 fn list_tx(a: State<App>, limit: i64) -> R<Vec<TxRow>> {
     let c = db(&a)?;
-    let mut st = c.prepare("SELECT t.id,a.name,t.amount_cents,COALESCE(t.note,''),t.at FROM tx t JOIN accounts a ON a.id=t.account_id ORDER BY t.at DESC,t.id DESC LIMIT ?1").map_err(e)?;
-    let rows = st.query_map([limit], |r| Ok(TxRow { id: r.get(0)?, account: r.get(1)?, amount_cents: r.get(2)?, note: r.get(3)?, at: r.get(4)? })).map_err(e)?;
+    let mut st = c.prepare("SELECT t.id,a.name,t.amount_cents,COALESCE(t.note,''),t.at,COALESCE(t.category,''),t.is_transfer FROM tx t JOIN accounts a ON a.id=t.account_id ORDER BY t.at DESC,t.id DESC LIMIT ?1").map_err(e)?;
+    let rows = st.query_map([limit], |r| Ok(TxRow { id: r.get(0)?, account: r.get(1)?, amount_cents: r.get(2)?, note: r.get(3)?, at: r.get(4)?, category: r.get(5)?, transfer: r.get::<_, i64>(6)? != 0 })).map_err(e)?;
     let v = rows.collect::<Result<Vec<_>, _>>().map_err(e)?;
     Ok(v)
 }
@@ -265,8 +272,8 @@ fn spend_summary(a: State<App>, from: i64) -> R<Summary> {
 #[tauri::command]
 fn list_tx_range(a: State<App>, from: i64, to: i64) -> R<Vec<TxRow>> {
     let c = db(&a)?;
-    let mut st = c.prepare("SELECT t.id,a.name,t.amount_cents,COALESCE(t.note,''),t.at FROM tx t JOIN accounts a ON a.id=t.account_id WHERE t.at>=?1 AND t.at<?2 ORDER BY t.at DESC,t.id DESC").map_err(e)?;
-    let rows = st.query_map(params![from, to], |r| Ok(TxRow { id: r.get(0)?, account: r.get(1)?, amount_cents: r.get(2)?, note: r.get(3)?, at: r.get(4)? })).map_err(e)?;
+    let mut st = c.prepare("SELECT t.id,a.name,t.amount_cents,COALESCE(t.note,''),t.at,COALESCE(t.category,''),t.is_transfer FROM tx t JOIN accounts a ON a.id=t.account_id WHERE t.at>=?1 AND t.at<?2 ORDER BY t.at DESC,t.id DESC").map_err(e)?;
+    let rows = st.query_map(params![from, to], |r| Ok(TxRow { id: r.get(0)?, account: r.get(1)?, amount_cents: r.get(2)?, note: r.get(3)?, at: r.get(4)?, category: r.get(5)?, transfer: r.get::<_, i64>(6)? != 0 })).map_err(e)?;
     let v = rows.collect::<Result<Vec<_>, _>>().map_err(e)?;
     Ok(v)
 }
@@ -308,6 +315,41 @@ fn delete_profile(a: State<App>, id: String, password: Option<String>) -> R<()> 
     }
     let _ = entry(&id).and_then(|en| en.delete_credential().map_err(e));
     fs::remove_dir_all(&d).map_err(e)
+}
+
+#[derive(Serialize)] struct Fin { income_cents: i64, outcome_cents: i64 }
+
+#[tauri::command]
+fn add_transfer(a: State<App>, from_id: i64, to_id: i64, amount_cents: i64, note: String, at: i64) -> R<()> {
+    if from_id == to_id { return Err("Pick two different accounts".into()); }
+    if amount_cents <= 0 { return Err("Enter an amount above zero".into()); }
+    let mut c = db(&a)?;
+    let t = c.transaction().map_err(e)?;
+    t.execute("INSERT INTO tx(account_id,amount_cents,note,at,is_transfer) VALUES(?1,?2,?3,?4,1)", params![from_id, -amount_cents, note, at]).map_err(e)?;
+    t.execute("INSERT INTO tx(account_id,amount_cents,note,at,is_transfer) VALUES(?1,?2,?3,?4,1)", params![to_id, amount_cents, note, at]).map_err(e)?;
+    t.commit().map_err(e)
+}
+/// Income and outcome in [from, to). Transfers between your own accounts are not counted.
+#[tauri::command]
+fn finance_sum(a: State<App>, from: i64, to: i64) -> R<Fin> {
+    db(&a)?.query_row("SELECT COALESCE(SUM(CASE WHEN amount_cents>0 THEN amount_cents END),0), COALESCE(-SUM(CASE WHEN amount_cents<0 THEN amount_cents END),0) FROM tx WHERE is_transfer=0 AND at>=?1 AND at<?2", params![from, to],
+        |r| Ok(Fin { income_cents: r.get(0)?, outcome_cents: r.get(1)? })).map_err(e)
+}
+#[tauri::command]
+fn spend_by_category(a: State<App>, from: i64, to: i64) -> R<Vec<Slice>> {
+    let c = db(&a)?;
+    let mut st = c.prepare("SELECT COALESCE(NULLIF(category,''),'Uncategorized'),-SUM(amount_cents) AS s FROM tx WHERE amount_cents<0 AND is_transfer=0 AND at>=?1 AND at<?2 GROUP BY 1 ORDER BY s DESC").map_err(e)?;
+    let rows = st.query_map(params![from, to], |r| Ok(Slice { label: r.get(0)?, value: r.get(1)? })).map_err(e)?;
+    let v = rows.collect::<Result<Vec<_>, _>>().map_err(e)?;
+    Ok(v)
+}
+#[tauri::command]
+fn list_categories(a: State<App>) -> R<Vec<String>> {
+    let c = db(&a)?;
+    let mut st = c.prepare("SELECT DISTINCT category FROM tx WHERE category IS NOT NULL AND category<>'' ORDER BY category").map_err(e)?;
+    let rows = st.query_map([], |r| r.get::<_, String>(0)).map_err(e)?;
+    let v = rows.collect::<Result<Vec<_>, _>>().map_err(e)?;
+    Ok(v)
 }
 
 fn main() {

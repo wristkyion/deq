@@ -158,3 +158,11 @@ aside{height:calc(100vh - 36px)}
 .wgrid.edit .card.dragging{box-shadow:none}
 .wgrid .card.dragging>*{visibility:hidden}
 .wgrid .card.dragging::after{content:attr(data-title);position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--ac);font-weight:500}
+
+/* ---- wallets ---- */
+.wallets{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px}
+.wtile{display:flex;flex-direction:column;gap:4px;padding:14px;border:1px solid var(--bd);border-radius:14px;background:linear-gradient(135deg,color-mix(in srgb,var(--ac) 18%,transparent),transparent);transition:transform .15s,border-color .15s}
+.wtile:hover{transform:translateY(-2px);border-color:var(--ac)}
+.wtile .big{font-size:24px}
+.wgrid .wallets{flex:1;overflow:auto;align-content:start}
+.split{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;font-size:13px}

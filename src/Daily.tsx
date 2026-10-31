@@ -16,8 +16,8 @@ export default function Daily(){
   },[d]);
   const shift=(n:number)=>{const x=new Date(d+'T12:00:00');x.setDate(x.getDate()+n);setD(iso(x))};
   const secs=times.reduce((a,t)=>a+t.end-t.start,0);
-  const out=-txs.filter(t=>t.amount_cents<0).reduce((a,t)=>a+t.amount_cents,0);
-  const inn=txs.filter(t=>t.amount_cents>0).reduce((a,t)=>a+t.amount_cents,0);
+  const out=-txs.filter(t=>!t.transfer&&t.amount_cents<0).reduce((a,t)=>a+t.amount_cents,0);
+  const inn=txs.filter(t=>!t.transfer&&t.amount_cents>0).reduce((a,t)=>a+t.amount_cents,0);
   return <>
     <header>
       <div><h1>Daily</h1><p className="sub">Everything you recorded on one date.</p></div>

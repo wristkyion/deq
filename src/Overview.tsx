@@ -1,18 +1,19 @@
 import {DragEvent,useEffect,useLayoutEffect,useRef,useState} from 'react';
-import {api,day,dur,money,Sess,Slice,Stats,TxRow} from './api';
+import {Acc,api,day,dur,Fin,money,Sess,Slice,Stats,TxRow} from './api';
 import {Line,Pie,Radar} from './Charts';
 import {useToast} from './Toast';
 
-type Kind='balance'|'today'|'week'|'pie'|'spend'|'recent'|'note'|'counter'|'github'|'income';
+type Kind='balance'|'today'|'week'|'pie'|'spend'|'recent'|'wallet'|'finance'|'note'|'counter'|'github'|'income';
 type Size='s'|'w'|'b';
 type W={id:string;kind:Kind;title:string;size:Size;text?:string;n?:number;wide?:boolean;style?:'bar'|'line'|'radar'};
 const SIZES:[Size,string][]=[['s','Square 1:1'],['w','Wide 1:2'],['b','Big 2:2']];
 const CAT:{kind:Kind;title:string;mod?:'github'|'commissions'}[]=[
   {kind:'balance',title:'Recorded balance'},{kind:'today',title:'Today'},{kind:'week',title:'Time this week'},
   {kind:'pie',title:'Time by project'},{kind:'spend',title:'Spending by account'},{kind:'recent',title:'Recent transactions'},
+  {kind:'wallet',title:'Wallets'},{kind:'finance',title:'Finance this month'},
   {kind:'note',title:'Note'},{kind:'counter',title:'Counter'},
   {kind:'github',title:'GitHub commits',mod:'github'},{kind:'income',title:'Commission income',mod:'commissions'}];
-const DEFSIZE: Partial<Record<Kind, Size>> = { week: 'w', recent: 'w' };
+const DEFSIZE:Partial<Record<Kind,Size>>={week:'w',recent:'w',wallet:'w'};
 const NOGHOST=new Image();NOGHOST.src='data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'; // hides the browser's drag picture
 const top=(a:Slice[])=>{const s=a.filter(x=>x.value>0);return s.length>6?[...s.slice(0,5),{label:'Other',value:s.slice(5).reduce((n,x)=>n+x.value,0)}]:s};
 const mk=(kind:Kind,size:Size='s'):W=>({id:Math.random().toString(36).slice(2,8),kind,size,title:CAT.find(c=>c.kind===kind)!.title,text:'',n:0});
@@ -26,13 +27,15 @@ export default function Overview({s}:{s:Sess}){
   const [pr,setPr]=useState<Slice[]>([]);
   const [sp,setSp]=useState<Slice[]>([]);
   const [rc,setRc]=useState<TxRow[]>([]);
+  const [acs,setAcs]=useState<Acc[]>([]);
+  const [fn,setFn]=useState<Fin|null>(null);
   const ready=useRef(false);
   const toast=useToast();
   const [drag,setDrag]=useState<string|null>(null);
   const [gone,setGone]=useState<string|null>(null);
   const gridRef=useRef<HTMLDivElement>(null);
-  const prev = useRef(new Map<string, { x: number; y: number; w: number; h: number }>());
-  const last = useRef(0); // time of the last reorder, so tiles don't reorder while still sliding
+  const prev=useRef(new Map<string,{x:number;y:number;w:number;h:number}>());
+  const last=useRef(0); // time of the last reorder, so tiles don't reorder while still sliding
 
   useLayoutEffect(()=>{ // animate every card from its old position and size to the new one
     const calm=document.documentElement.dataset.motion==='reduce'||matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -52,6 +55,8 @@ export default function Overview({s}:{s:Sess}){
     api.projects().then(setPr).catch(toast.error);
     api.spendBy(Math.floor(new Date(d.getFullYear(),d.getMonth(),1).getTime()/1000)).then(setSp).catch(toast.error);
     api.txs(6).then(setRc).catch(toast.error);
+    api.accounts().then(setAcs).catch(toast.error);
+    api.finance(Math.floor(new Date(d.getFullYear(),d.getMonth(),1).getTime()/1000),Math.floor(new Date(d.getFullYear(),d.getMonth(),d.getDate()+1).getTime()/1000)).then(setFn).catch(toast.error);
   },[]);
   useEffect(()=>{ // save layout (encrypted by the backend) shortly after each change
     if(!ws)return;
@@ -69,7 +74,7 @@ export default function Overview({s}:{s:Sess}){
     const b=[...a],i=b.findIndex(x=>x.id===drag),j=b.findIndex(x=>x.id===target);
     b.splice(j,0,b.splice(i,1)[0]);return b;
   });
-  const hover=(e:DragEvent<HTMLElement>)=>{  // <- NEW (step 2), right after dragTo
+  const hover=(e:DragEvent<HTMLElement>)=>{
     if(Date.now()-last.current<200)return;
     const g=gridRef.current;if(!g)return;
     const r=g.getBoundingClientRect(),x=e.clientX-r.left,y=e.clientY-r.top;
@@ -89,6 +94,12 @@ export default function Overview({s}:{s:Sess}){
     case 'pie':return <Pie data={top(pr)} fmt={dur}/>;
     case 'spend':return <Pie data={top(sp)} fmt={money}/>;
     case 'recent':return rc.length?<div className="list">{rc.map(t=><div className="row" key={t.id}><span>{t.note||'No note'}<br/><span className="note">{day(t.at)}, {t.account}</span></span><b className={t.amount_cents<0?'neg':'pos'}>{money(t.amount_cents)}</b></div>)}</div>:<p className="note">No transactions yet.</p>;
+    case 'wallet':{const wl=acs.filter(a=>a.kind==='Wallet');return wl.length
+      ?<><div className="note">Total {money(wl.reduce((n,a)=>n+a.balance_cents,0))}</div><div className="wallets">{wl.map(a=><div className="wtile" key={a.id}><span className="note">{a.name}</span><b className="big">{money(a.balance_cents)}</b></div>)}</div></>
+      :<p className="note">No wallets yet. Add one in Bank &amp; Wallet.</p>}
+    case 'finance':return fn
+      ?<><div className="big">{money(fn.income_cents-fn.outcome_cents)}</div><p className="note">Net this month</p><div className="split"><span>In <b className="pos">{money(fn.income_cents)}</b></span><span>Out <b className="neg">{money(fn.outcome_cents)}</b></span></div></>
+      :<p className="note">…</p>;
     case 'note':return <textarea aria-label="Note" placeholder="Write anything…" value={w.text} onChange={e=>set(w.id,{text:e.target.value})}/>;
     case 'counter':return <div className="ctr"><button className="btn o" aria-label="Decrease" onClick={()=>set(w.id,{n:(w.n??0)-1})}>−</button><span className="big">{w.n??0}</span><button className="btn o" aria-label="Increase" onClick={()=>set(w.id,{n:(w.n??0)+1})}>+</button></div>;
     case 'github':return <p className="note">No GitHub data yet. Connect your account to see commits.</p>;
@@ -110,7 +121,7 @@ export default function Overview({s}:{s:Sess}){
       </div>
     </header>
     {ws.filter(vis).length===0&&<div className="empty"><h2>No widgets yet</h2><p>Choose Customize to add your first one.</p></div>}
-        <div ref={gridRef} className={`wgrid${edit?' edit':''}`} onDragOver={e=>{if(!drag)return;e.preventDefault();hover(e)}}>
+    <div ref={gridRef} className={`wgrid${edit?' edit':''}`} onDragOver={e=>{if(!drag)return;e.preventDefault();hover(e)}}>
       {ws.map((w,i)=>vis(w)&&<section key={w.id} data-id={w.id} data-title={w.title}
         className={`card sz-${w.size}${drag===w.id?' dragging':''}${gone===w.id?' leaving':''}`}
         onDrop={e=>e.preventDefault()}>

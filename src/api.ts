@@ -4,7 +4,8 @@ export type Prof={id:string;name:string;locked:boolean};
 export type Sess={name:string;modules:Mods;locked:boolean};
 export type Stats={balance_cents:number;week:number[]};
 export type Acc={id:number;name:string;kind:string;balance_cents:number};
-export type TxRow={id:number;account:string;amount_cents:number;note:string;at:number};
+export type TxRow={id:number;account:string;amount_cents:number;note:string;at:number;category:string;transfer:boolean};
+export type Fin={income_cents:number;outcome_cents:number};
 export type TimeRow={id:number;project:string;start:number;end:number};
 export type Summary={spent_cents:number;income_cents:number};
 export type Slice={label:string;value:number};
@@ -34,7 +35,12 @@ export const api={
   timeRange:(from:number,to:number)=>invoke<TimeRow[]>('list_time_range',{from,to}),
   projects:()=>invoke<Slice[]>('project_totals'),
   spendBy:(from:number)=>invoke<Slice[]>('spend_by_account',{from}),
-  delProfile:(id:string,password:string)=>invoke('delete_profile',{id,password:password||null}),
+  delProfile: (id: string, password: string) => invoke('delete_profile', { id, password: password || null }),
+  addTx:(accountId:number,amountCents:number,note:string,at:number,category?:string)=>invoke('add_tx',{accountId,amountCents,note,at,category:category||null}),
+  transfer:(fromId:number,toId:number,amountCents:number,note:string,at:number)=>invoke('add_transfer',{fromId,toId,amountCents,note,at}),
+  finance:(from:number,to:number)=>invoke<Fin>('finance_sum',{from,to}),
+  byCategory:(from:number,to:number)=>invoke<Slice[]>('spend_by_category',{from,to}),
+  categories:()=>invoke<string[]>('list_categories'),
 };
 export const money=(c:number)=>(c/100).toLocaleString(undefined,{style:'currency',currency:'USD'});
 export const dur=(s:number)=>`${Math.floor(s/3600)}h ${Math.floor(s%3600/60)}m`;

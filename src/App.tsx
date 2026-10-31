@@ -6,11 +6,13 @@ import Daily from './Daily';
 import Activity from './Activity';
 import Bank from './Bank';
 import Settings from './Settings';
+import Finance from './Finance';
 
 export default function App() {
   const TITLES:Record<string,string>={
     'gh-projects':'GitHub Projects','gh-activity':'GitHub Activity','gh-profile':'GitHub Profile',
-    'cm-overview':'Commissions Overview','cm-products':'Commissions Products','cm-orders':'Commissions Orders','cm-finance':'Commissions Finance'};
+    'cm-overview':'Commissions Overview','cm-products':'Commissions Products','cm-orders':'Commissions Orders',
+    finance:'Finance'};
   const [cfg,setCfg]=useState<Cfg|null>(null);
   const [sess,setSess]=useState<Sess|null>(null);
   const [aid,setAid]=useState('');
@@ -36,14 +38,14 @@ export default function App() {
       <nav className="side-main" aria-label="Main navigation">
         {B('overview','Overview')}
         <div className="grp">Personal</div>
-        {B('daily','Daily',true)}{B('activity','Activity',true)}{B('bank','Bank & Wallet',true)}
+        {B('daily','Daily',true)}{B('activity','Activity',true)}{B('bank','Bank & Wallet',true)}{B('finance','Finance',true)}
         {m.github&&<>
           <div className="grp">GitHub</div>
           {B('gh-projects','Projects',true)}{B('gh-activity','Activity',true)}{B('gh-profile','Profile',true)}
         </>}
         {m.commissions&&<>
           <div className="grp">Commissions</div>
-          {B('cm-overview','Overview',true)}{B('cm-products','Products',true)}{B('cm-orders','Orders',true)}{B('cm-finance','Finance',true)}
+          {B('cm-overview','Overview',true)}{B('cm-products','Products',true)}{B('cm-orders','Orders',true)}
         </>}
       </nav>
       <div className="side-foot">
@@ -57,7 +59,8 @@ export default function App() {
       {cur==='overview'&&<Overview s={sess}/>}
       {cur==='daily'&&<Daily/>}
       {cur==='activity'&&<Activity/>}
-      {cur==='bank'&&<Bank/>}
+      {cur === 'bank' && <Bank />}
+      {cur==='finance'&&<Finance/>}
       {(cur.startsWith('gh-')||cur.startsWith('cm-'))&&<><header><h1>{TITLES[cur]}</h1></header><div className="empty"><h2>Coming next</h2><p>This page is a placeholder. We’ll build it later.</p></div></>}
       {cur==='settings'&&<Settings s={sess} setS={setSess} cfg={cfg} upd={upd} activeId={aid} onGone={()=>setSess(null)}/>}
     </div></main>
