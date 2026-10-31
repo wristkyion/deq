@@ -39,7 +39,10 @@ export const api={
   transfer:(fromId:number,toId:number,amountCents:number,note:string,at:number)=>invoke('add_transfer',{fromId,toId,amountCents,note,at}),
   finance:(from:number,to:number)=>invoke<Fin>('finance_sum',{from,to}),
   byCategory:(from:number,to:number)=>invoke<Slice[]>('spend_by_category',{from,to}),
-  categories:()=>invoke<string[]>('list_categories'),
+  categories: () => invoke<string[]>('list_categories'),
+  delTx:(id:number)=>invoke('delete_tx',{id}),
+  delTime: (id: number) => invoke('delete_time', { id }),
+  delAccount:(id:number)=>invoke('delete_account',{id}),
 };
 export const money=(c:number)=>(c/100).toLocaleString(undefined,{style:'currency',currency:'USD'});
 export const dur=(s:number)=>`${Math.floor(s/3600)}h ${Math.floor(s%3600/60)}m`;
@@ -48,3 +51,4 @@ export const now=()=>Math.floor(Date.now()/1000);
 export const cents=(v:string)=>Math.round(parseFloat(v||'0')*100);
 export const day=(t:number)=>new Date(t*1000).toLocaleDateString(undefined,{day:'numeric',month:'short',year:'numeric'});
 export const clock=(t:number)=>new Date(t*1000).toLocaleString(undefined,{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'});
+export const kindName=(k:string)=>k==='Wallet'?'E-wallet':k;

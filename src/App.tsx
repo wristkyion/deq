@@ -38,7 +38,7 @@ export default function App() {
       <nav className="side-main" aria-label="Main navigation">
         {B('overview','Overview')}
         <div className="grp">Personal</div>
-        {B('daily','Daily',true)}{B('activity','Activity',true)}{B('bank','Bank & Wallet',true)}{B('finance','Finance',true)}
+        {B('daily','Daily',true)}{B('activity','Activity',true)}{B('bank','Bank & E-Wallet',true)}{B('finance','Finance',true)}
         {m.github&&<>
           <div className="grp">GitHub</div>
           {B('gh-projects','Projects',true)}{B('gh-activity','Activity',true)}{B('gh-profile','Profile',true)}

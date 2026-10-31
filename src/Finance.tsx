@@ -1,6 +1,8 @@
 import {FormEvent,useEffect,useState} from 'react';
-import {Acc,api,cents,day,Fin,money,now,Slice,TxRow} from './api';
+import {Acc,api,cents,Fin,money,now,Slice,TxRow} from './api';
 import {Pie} from './Charts';
+import Dialog,{Actions} from './Dialog';
+import TxRows from './TxRows';
 import {useToast} from './Toast';
 
 type Period='month'|'30'|'year';
@@ -19,6 +21,7 @@ export default function Finance(){
   const [p,setP]=useState<Period>('month');
   const [flt,setFlt]=useState<'all'|'in'|'out'>('all');
   const [kind,setKind]=useState<'in'|'out'>('out');
+  const [dlg,setDlg]=useState(false);
   const [accs,setAccs]=useState<Acc[]>([]);
   const [cats,setCats]=useState<string[]>([]);
   const [fin,setFin]=useState<Fin|null>(null);
@@ -31,32 +34,44 @@ export default function Finance(){
   };
   useEffect(()=>{load()},[p]);
   const add=async(ev:FormEvent<HTMLFormElement>)=>{
-    ev.preventDefault();const f=ev.currentTarget;
-    const v=Object.fromEntries(new FormData(f)) as Record<string,string>;
+    ev.preventDefault();
+    const v=Object.fromEntries(new FormData(ev.currentTarget)) as Record<string,string>;
     const amt=Math.abs(cents(v.amount));
     if(!amt){toast.error('Enter an amount above zero');return}
     try{
       await api.addTx(+v.account,kind==='out'?-amt:amt,v.note,v.date?Math.floor(new Date(v.date+'T12:00:00').getTime()/1000):now(),v.category);
-      f.reset();toast.ok(kind==='out'?'Outcome added':'Income added');load();
+      toast.ok(kind==='out'?'Outcome added':'Income added');setDlg(false);load();
     }catch(x){toast.error(x)}
   };
   const shown=txs.filter(t=>flt==='all'||(!t.transfer&&(flt==='in'?t.amount_cents>0:t.amount_cents<0)));
   const net=fin?fin.income_cents-fin.outcome_cents:0;
   const seg=<T extends string>(val:T,set:(v:T)=>void,opts:[T,string][])=><div className="seg">{opts.map(([v,l])=><button type="button" key={v} aria-pressed={val===v} onClick={()=>set(v)}>{l}</button>)}</div>;
 
-  return <>
+  return <div className="fit">
     <header>
       <div><h1>Finance</h1><p className="sub">Income and outcome across all your accounts. Moves between your own accounts are not counted.</p></div>
-      {seg(p,setP,PERIODS)}
+      <div className="acts">{seg(p,setP,PERIODS)}<button className="btn" onClick={()=>setDlg(true)}>Add income or outcome</button></div>
     </header>
-    <div className="grid">
-      <section className="card"><h2>Income</h2><div className="big pos">{fin?money(fin.income_cents):'…'}</div></section>
-      <section className="card"><h2>Outcome</h2><div className="big neg">{fin?money(fin.outcome_cents):'…'}</div></section>
-      <section className="card"><h2>Net</h2><div className={`big ${net<0?'neg':'pos'}`}>{fin?money(net):'…'}</div></section>
+
+    <div className="stats">
+      <section className="card stat"><h2>Income</h2><div className="big pos">{fin?money(fin.income_cents):'…'}</div></section>
+      <section className="card stat"><h2>Outcome</h2><div className="big neg">{fin?money(fin.outcome_cents):'…'}</div></section>
+      <section className="card stat"><h2>Net</h2><div className={`big ${net<0?'neg':'pos'}`}>{fin?money(net):'…'}</div></section>
     </div>
-    <div className="grid" style={{marginTop:16}}>
-      <form className="card stack" onSubmit={add}>
-        <h2>Add to finance</h2>
+
+    <div className="cols">
+      <section className="card">
+        <div className="row"><h2>Transactions</h2>{seg(flt,setFlt,[['all','All'],['in','Income'],['out','Outcome']])}</div>
+        <div className="scroll"><div className="scroll"><TxRows txs={shown} empty="Nothing in this period yet." onChange={load}/></div></div>
+      </section>
+      <section className="card">
+        <h2>Outcome by category</h2>
+        <div className="grow"><Pie data={top(byCat)} fmt={money}/></div>
+      </section>
+    </div>
+
+    {dlg&&<Dialog title="Add income or outcome" onClose={()=>setDlg(false)}>
+      <form className="stack" onSubmit={add}>
         {seg(kind,setKind,[['out','Outcome'],['in','Income']])}
         <label>Account<select name="account" required>{accs.map(a=><option key={a.id} value={a.id}>{a.name} ({a.kind})</option>)}</select></label>
         <label>Amount<input name="amount" type="number" step="0.01" min="0" required/></label>
@@ -64,20 +79,9 @@ export default function Finance(){
         <datalist id="cats">{cats.map(c=><option key={c} value={c}/>)}</datalist>
         <label>Note<input name="note"/></label>
         <label>Date (empty = now)<input name="date" type="date"/></label>
-        <button className="btn" disabled={!accs.length}>{kind==='out'?'Add outcome':'Add income'}</button>
         {!accs.length&&<p className="note">Add an account in Bank &amp; Wallet first.</p>}
+        <Actions ok={kind==='out'?'Add outcome':'Add income'} onClose={()=>setDlg(false)} off={!accs.length}/>
       </form>
-      <section className="card">
-        <h2>Outcome by category</h2>
-        <div style={{height:200,display:'flex'}}><Pie data={top(byCat)} fmt={money}/></div>
-      </section>
-      <section className="card w">
-        <div className="row"><h2>Transactions</h2>{seg(flt,setFlt,[['all','All'],['in','Income'],['out','Outcome']])}</div>
-        {shown.length===0&&<p className="note">Nothing in this period yet.</p>}
-        {shown.map(t=><div className="row" key={t.id}>
-          <span>{t.transfer?`Move${t.note?`: ${t.note}`:''}`:t.note||'No note'}<br/><span className="note">{day(t.at)}, {t.account}{t.category?`, ${t.category}`:''}</span></span>
-          <b className={t.transfer?'note':t.amount_cents<0?'neg':'pos'}>{money(t.amount_cents)}</b></div>)}
-      </section>
-    </div>
-  </>;
+    </Dialog>}
+  </div>;
 }

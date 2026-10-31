@@ -352,12 +352,38 @@ fn list_categories(a: State<App>) -> R<Vec<String>> {
     Ok(v)
 }
 
+#[tauri::command]
+fn delete_tx(a: State<App>, id: i64) -> R<()> {
+    let mut c = db(&a)?;
+    let t = c.transaction().map_err(e)?;
+    let (amt, at, tr): (i64, i64, i64) = t.query_row("SELECT amount_cents,at,is_transfer FROM tx WHERE id=?1", [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(|_| "Transaction not found".to_string())?;
+    t.execute("DELETE FROM tx WHERE id=?1", [id]).map_err(e)?;
+    if tr == 1 { // a move is stored as two rows, so remove the other half too
+        t.execute("DELETE FROM tx WHERE id=(SELECT id FROM tx WHERE is_transfer=1 AND at=?1 AND amount_cents=?2 LIMIT 1)", params![at, -amt]).map_err(e)?;
+    }
+    t.commit().map_err(e)
+}
+#[tauri::command]
+fn delete_time(a: State<App>, id: i64) -> R<()> {
+    db(&a)?.execute("DELETE FROM time_entries WHERE id=?1", [id]).map_err(e)?; Ok(())
+}
+
+#[tauri::command]
+fn delete_account(a: State<App>, id: i64) -> R<()> {
+    let mut c = db(&a)?;
+    let t = c.transaction().map_err(e)?;
+    // the other half of a move stays in its account, as a normal transaction
+    t.execute("UPDATE tx SET is_transfer=0 WHERE is_transfer=1 AND account_id<>?1 AND EXISTS (SELECT 1 FROM tx o WHERE o.account_id=?1 AND o.is_transfer=1 AND o.at=tx.at AND o.amount_cents=-tx.amount_cents)", [id]).map_err(e)?;
+    let n = t.execute("DELETE FROM accounts WHERE id=?1", [id]).map_err(e)?; // its transactions go with it (ON DELETE CASCADE)
+    if n == 0 { return Err("Account not found".into()); }
+    t.commit().map_err(e)
+}
 fn main() {
     let root = data_root();
     let _ = fs::create_dir_all(root.join("user"));
     tauri::Builder::default()
         .manage(App { root, s: Mutex::new(None) })
-        .invoke_handler(tauri::generate_handler![cfg_get, cfg_set, profiles, create_profile, open_profile, lock_now, set_password, remove_password, recover, set_module, dashboard_get, dashboard_set, add_time, add_account, add_tx, list_accounts, stats, list_tx, list_time, spend_summary, list_tx_range, list_time_range, project_totals, spend_by_account, delete_profile, spend_by_category, finance_sum, list_categories, add_transfer])
+        .invoke_handler(tauri::generate_handler![cfg_get, cfg_set, profiles, create_profile, open_profile, lock_now, set_password, remove_password, recover, set_module, dashboard_get, dashboard_set, add_time, add_account, add_tx, list_accounts, stats, list_tx, list_time, spend_summary, list_tx_range, list_time_range, project_totals, spend_by_account, delete_profile, spend_by_category, finance_sum, list_categories, add_transfer, delete_tx, delete_time, delete_account])
         .run(tauri::generate_context!())
         .expect("failed to start Deq");
 }
