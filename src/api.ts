@@ -25,7 +25,6 @@ export const api={
   saveDash:(json:string)=>invoke('dashboard_set',{json}),
   addTime:(project:string,start:number,end:number)=>invoke('add_time',{project,start,end}),
   addAccount:(name:string,kind:string,openingCents:number)=>invoke('add_account',{name,kind,openingCents}),
-  addTx:(accountId:number,amountCents:number,note:string,at:number)=>invoke('add_tx',{accountId,amountCents,note,at}),
   accounts:()=>invoke<Acc[]>('list_accounts'),
   stats:(weekStart:number)=>invoke<Stats>('stats',{weekStart}),
   txs:(limit:number)=>invoke<TxRow[]>('list_tx',{limit}),

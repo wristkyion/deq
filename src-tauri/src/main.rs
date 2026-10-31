@@ -357,7 +357,7 @@ fn main() {
     let _ = fs::create_dir_all(root.join("user"));
     tauri::Builder::default()
         .manage(App { root, s: Mutex::new(None) })
-        .invoke_handler(tauri::generate_handler![cfg_get, cfg_set, profiles, create_profile, open_profile, lock_now, set_password, remove_password, recover, set_module, dashboard_get, dashboard_set, add_time, add_account, add_tx, list_accounts, stats, list_tx, list_time, spend_summary, list_tx_range, list_time_range, project_totals, spend_by_account, delete_profile])
+        .invoke_handler(tauri::generate_handler![cfg_get, cfg_set, profiles, create_profile, open_profile, lock_now, set_password, remove_password, recover, set_module, dashboard_get, dashboard_set, add_time, add_account, add_tx, list_accounts, stats, list_tx, list_time, spend_summary, list_tx_range, list_time_range, project_totals, spend_by_account, delete_profile, spend_by_category, finance_sum, list_categories, add_transfer])
         .run(tauri::generate_context!())
         .expect("failed to start Deq");
 }
