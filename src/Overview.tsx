@@ -50,6 +50,17 @@ export default function Overview({s}:{s:Sess}){
       prev.current.set(id,n);
     });
   });
+  useLayoutEffect(()=>{ // size the grid first, so the animation below never sees the fallback layout
+    const g=gridRef.current;if(!g)return;
+    const fit=()=>{
+      const w=g.clientWidth,n=Math.max(1,Math.floor((w+16)/236)),c=(w-(n-1)*16)/n;
+      g.style.setProperty('--cols',String(n));g.style.setProperty('--cell',`${c}px`);
+      g.querySelectorAll<HTMLElement>('[data-id]').forEach(el=>prev.current.set(el.dataset.id!,{x:el.offsetLeft,y:el.offsetTop,w:el.offsetWidth,h:el.offsetHeight})); // resizing the window is not a reorder, so don't animate it
+    };
+    fit();
+    const ro=new ResizeObserver(fit);ro.observe(g);
+    return()=>ro.disconnect();
+  },[ws===null]);
 
   useEffect(()=>{
     api.dash().then(j=>{try{setWs((j?JSON.parse(j) as W[]:DEF()).map(w=>({...w,size:w.size??(w.wide?'w':'s')})))}catch{setWs(DEF())}}).catch(toast.error);
@@ -61,14 +72,24 @@ export default function Overview({s}:{s:Sess}){
     api.txs(6).then(setRc).catch(toast.error);
     api.accounts().then(setAcs).catch(toast.error);
     api.finance(Math.floor(new Date(d.getFullYear(),d.getMonth(),1).getTime()/1000),Math.floor(new Date(d.getFullYear(),d.getMonth(),d.getDate()+1).getTime()/1000)).then(setFn).catch(toast.error);
-  },[]);
+  }, []);
+  useEffect(()=>{ // size the grid so a Square tile is really square: pick the column count, then use the column width as the row height
+    const g=gridRef.current;if(!g)return;
+    const fit=()=>{
+      const w=g.clientWidth,n=Math.max(1,Math.floor((w+16)/236)),c=(w-(n-1)*16)/n;
+      g.style.setProperty('--cols',String(n));g.style.setProperty('--cell',`${c}px`);
+    };
+    fit();
+    const ro=new ResizeObserver(fit);ro.observe(g);
+    return()=>ro.disconnect();
+  },[ws===null]);
   useEffect(()=>{ // save layout (encrypted by the backend) shortly after each change
     if(!ws)return;
     if(!ready.current){ready.current=true;return}
     const t=setTimeout(()=>api.saveDash(JSON.stringify(ws)),400);
     return()=>clearTimeout(t);
   },[ws]);
-  if(!ws)return null;
+  if (!ws) return null;
 
   const set=(id:string,p:Partial<W>)=>setWs(ws.map(w=>w.id===id?{...w,...p}:w));
   const move=(i:number,d:number)=>{const a=[...ws],j=i+d;if(j<0||j>=a.length)return;[a[i],a[j]]=[a[j],a[i]];setWs(a)};
@@ -149,7 +170,7 @@ export default function Overview({s}:{s:Sess}){
           <span className="handle" draggable
             onDragStart={(e:DragEvent<HTMLElement>)=>{setDrag(w.id);e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain',w.id);e.dataTransfer.setDragImage(NOGHOST,0,0)}}
             onDragEnd={()=>setDrag(null)}>Drag to sort</span>
-          {w.kind!=='divider'&&<select aria-label="Size" value={w.size} onChange={e=>set(w.id,{size:e.target.value as Size})}>{SIZES.map(([z,l])=><option key={z} value={z}>{l}</option>)}</select>}
+          {w.kind!=='divider'&&w.kind!=='heading'&&<select aria-label="Size" value={w.size} onChange={e=>set(w.id,{size:e.target.value as Size})}>{SIZES.map(([z,l])=><option key={z} value={z}>{l}</option>)}</select>}
           {w.kind === 'week' && <select aria-label="Style" value={w.style ?? 'bar'} onChange={e => set(w.id, { style: e.target.value as W['style'] })}><option value="bar">Bar</option><option value="line">Line</option><option value="radar">Radar</option></select>}
           {(w.kind==='pie'||w.kind==='spend')&&<select aria-label="Style" value={w.style??'pie'} onChange={e=>set(w.id,{style:e.target.value as W['style']})}><option value="pie">Pie</option><option value="line">Line</option></select>}
           {(w.kind==='walletcard'||w.kind==='bankcard')&&<select aria-label="Account" value={w.acc??''} onChange={e=>set(w.id,{acc:e.target.value?+e.target.value:undefined})}><option value="">Choose account</option>{acs.filter(a=>a.kind===(w.kind==='walletcard'?'Wallet':'Bank')).map(a=><option key={a.id} value={a.id}>{a.name}</option>)}</select>}

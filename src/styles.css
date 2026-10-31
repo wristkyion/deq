@@ -232,3 +232,31 @@ main{overflow-x:hidden}
 .bcard>div:last-child{display:flex;flex-direction:column;gap:2px;font-size:13px;min-width:0}
 .bcard>div:last-child span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .bcard .big{font-size:22px}
+
+.wgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));grid-auto-rows:38px;gap:16px;position:relative}
+.wgrid.edit{grid-auto-rows:55.5px}
+.sz-s{grid-row:span 4}
+.sz-w{grid-column:span 2;grid-row:span 4}
+.sz-b{grid-column:span 2;grid-row:span 8}
+
+.wgrid .k-divider,.wgrid .k-heading{grid-column:1/-1;grid-row:span 3;justify-content:center}
+.wgrid .k-heading{grid-row:span 4}
+.wgrid:not(.edit) .k-divider{grid-row:span 1}
+.wgrid:not(.edit) .k-heading{grid-row:span 2}
+.sep{border:0;border-top:1px solid var(--bd);margin:auto 0;width:100%}
+.wgrid:not(.edit) .card.k-divider,.wgrid:not(.edit) .card.k-heading{background:transparent;border-color:transparent;padding:4px;gap:2px}
+.wgrid:not(.edit) .card.k-divider:hover,.wgrid:not(.edit) .card.k-heading:hover{transform:none;border-color:transparent}
+.wgrid:not(.edit) .k-divider h2{display:none}
+.wgrid:not(.edit) .k-heading h2{font-size:32px;font-weight:600;line-height:1.15;color:var(--tx)}
+.k-heading .note{font-size:16px;margin:0}
+
+/* ---- true square tiles: column width = tile height ---- */
+.wgrid{grid-template-columns:repeat(var(--cols,4),minmax(0,1fr));grid-auto-rows:calc((var(--cell,200px) - 48px)/4)}
+.wgrid.edit{grid-auto-rows:calc((var(--cell,200px)*1.35 - 48px)/4)}
+
+/* ---- thin scrollbars: 4px at rest, 6px on hover ---- */
+*::-webkit-scrollbar{width:12px;height:12px}
+*::-webkit-scrollbar-track,*::-webkit-scrollbar-corner{background:transparent}
+*::-webkit-scrollbar-thumb{background:color-mix(in srgb,var(--mut) 45%,transparent);background-clip:padding-box;border:4px solid transparent;border-radius:99px}
+*::-webkit-scrollbar-thumb:hover{background:var(--mut);background-clip:padding-box;border-width:3px}
+*::-webkit-scrollbar-thumb:active{background:var(--ac);background-clip:padding-box;border-width:3px}
