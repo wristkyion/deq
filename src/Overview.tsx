@@ -1,17 +1,21 @@
 import {DragEvent,useEffect,useLayoutEffect,useRef,useState} from 'react';
-import {Acc,api,day,dur,Fin,money,Sess,Slice,Stats,TxRow} from './api';
+import {Acc,api,day,dur,Fin,kindName,money,Sess,Slice,Stats,TxRow} from './api';
+import Calendar from './Calendar';
 import {Line,Pie,Radar} from './Charts';
-import {useToast} from './Toast';
+import { useToast } from './Toast';
 
-type Kind='balance'|'today'|'week'|'pie'|'spend'|'recent'|'wallet'|'finance'|'note'|'counter'|'github'|'income';
+
+type Kind='balance'|'today'|'week'|'pie'|'spend'|'recent'|'wallet'|'finance'|'note'|'counter'|'github'|'income'|'divider'|'heading'|'calendar'|'walletcard'|'bankcard';
 type Size='s'|'w'|'b';
-type W={id:string;kind:Kind;title:string;size:Size;text?:string;n?:number;wide?:boolean;style?:'bar'|'line'|'radar'};
+type W={id:string;kind:Kind;title:string;size:Size;text?:string;n?:number;wide?:boolean;style?:'pie'|'bar'|'line'|'radar';acc?:number};
 const SIZES:[Size,string][]=[['s','Square 1:1'],['w','Wide 1:2'],['b','Big 2:2']];
 const CAT:{kind:Kind;title:string;mod?:'github'|'commissions'}[]=[
   {kind:'balance',title:'Recorded balance'},{kind:'today',title:'Today'},{kind:'week',title:'Time this week'},
   {kind:'pie',title:'Time by project'},{kind:'spend',title:'Spending by account'},{kind:'recent',title:'Recent transactions'},
   {kind:'wallet',title:'Wallets'},{kind:'finance',title:'Finance this month'},
   {kind:'note',title:'Note'},{kind:'counter',title:'Counter'},
+  {kind:'divider',title:'Line separator'},{kind:'heading',title:'Title & subtitle'},{kind:'calendar',title:'Calendar'},
+  {kind:'walletcard',title:'Wallet card'},{kind:'bankcard',title:'Bank card'},
   {kind:'github',title:'GitHub commits',mod:'github'},{kind:'income',title:'Commission income',mod:'commissions'}];
 const DEFSIZE:Partial<Record<Kind,Size>>={week:'w',recent:'w',wallet:'w'};
 const NOGHOST=new Image();NOGHOST.src='data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'; // hides the browser's drag picture
@@ -83,6 +87,10 @@ export default function Overview({s}:{s:Sess}){
   };
   const remove=(w:W)=>{setGone(w.id);setTimeout(()=>{setWs(a=>a&&a.filter(x=>x.id!==w.id));setGone(null);toast.info(`Removed “${w.title}”`)},180)};
 
+  const chart=(d:Slice[],fmt:(n:number)=>string,w:W)=>w.style==='line'&&d.length>1
+    ?<Line values={d.map(x=>x.value)} labels={d.map(x=>x.label.length>8?x.label.slice(0,7)+'…':x.label)} fmt={fmt}/>
+    :<Pie data={d} fmt={fmt}/>;
+  
   const body=(w:W)=>{switch(w.kind){
     case 'balance':return <><div className="big">{st?money(st.balance_cents):'…'}</div><p className="note">Entered by you. Not synced with any bank.</p></>;
     case 'today':return <><div className="big">{dur(st?st.week[(new Date().getDay()+6)%7]:0)}</div><p className="note">Recorded today.</p></>;
@@ -91,8 +99,8 @@ export default function Overview({s}:{s:Sess}){
       if(w.style==='line')return <Line values={wk} labels={L}/>;
       if(w.style==='radar')return <Radar values={wk} labels={L}/>;
       return <div className="bars">{wk.map((v,i)=><div key={i}><b style={{height:`${v/mx*100}%`}}/>{L[i]}</div>)}</div>}
-    case 'pie':return <Pie data={top(pr)} fmt={dur}/>;
-    case 'spend':return <Pie data={top(sp)} fmt={money}/>;
+    case 'pie':return chart(top(pr),dur,w);
+    case 'spend':return chart(top(sp),money,w);
     case 'recent':return rc.length?<div className="list">{rc.map(t=><div className="row" key={t.id}><span>{t.note||'No note'}<br/><span className="note">{day(t.at)}, {t.account}</span></span><b className={t.amount_cents<0?'neg':'pos'}>{money(t.amount_cents)}</b></div>)}</div>:<p className="note">No transactions yet.</p>;
     case 'wallet':{const wl=acs.filter(a=>a.kind==='Wallet');return wl.length
       ?<><div className="note">Total {money(wl.reduce((n,a)=>n+a.balance_cents,0))}</div><div className="wallets">{wl.map(a=><div className="wtile" key={a.id}><span className="note">{a.name}</span><b className="big">{money(a.balance_cents)}</b></div>)}</div></>
@@ -101,14 +109,24 @@ export default function Overview({s}:{s:Sess}){
       ?<><div className="big">{money(fn.income_cents-fn.outcome_cents)}</div><p className="note">Net this month</p><div className="split"><span>In <b className="pos">{money(fn.income_cents)}</b></span><span>Out <b className="neg">{money(fn.outcome_cents)}</b></span></div></>
       :<p className="note">…</p>;
     case 'note':return <textarea aria-label="Note" placeholder="Write anything…" value={w.text} onChange={e=>set(w.id,{text:e.target.value})}/>;
-    case 'counter':return <div className="ctr"><button className="btn o" aria-label="Decrease" onClick={()=>set(w.id,{n:(w.n??0)-1})}>−</button><span className="big">{w.n??0}</span><button className="btn o" aria-label="Increase" onClick={()=>set(w.id,{n:(w.n??0)+1})}>+</button></div>;
+    case 'counter': return <div className="ctr"><button className="btn o" aria-label="Decrease" onClick={() => set(w.id, { n: (w.n ?? 0) - 1 })}>−</button><span className="big">{w.n ?? 0}</span><button className="btn o" aria-label="Increase" onClick={() => set(w.id, { n: (w.n ?? 0) + 1 })}>+</button></div>;
+    case 'divider':return <hr className="sep"/>;
+    case 'heading':return edit
+      ?<input aria-label="Subtitle" placeholder="Subtitle" value={w.text} onChange={e=>set(w.id,{text:e.target.value})}/>
+      :<p className="note">{w.text}</p>;
+    case 'calendar':return <Calendar/>;
+    case 'walletcard':case 'bankcard':{
+      const k=w.kind==='walletcard'?'Wallet':'Bank';
+      const a=acs.find(x=>x.id===w.acc&&x.kind===k);
+      if(a)return <div className={`bcard ${w.kind}`}><div className="split"><span>{kindName(a.kind)}</span><i className="chip"/></div><div><span>{a.name}</span><b className="big">{money(a.balance_cents)}</b></div></div>;
+      return <p className="note">{acs.some(x=>x.kind===k)?'Choose Customize, then pick an account.':`No ${kindName(k).toLowerCase()} accounts yet. Add one in Bank & E-Wallet.`}</p>}
     case 'github':return <p className="note">No GitHub data yet. Connect your account to see commits.</p>;
     case 'income':return <p className="note">No payments recorded yet.</p>;
   }};
 
   return <>
     <header>
-      <div><h1>Overview</h1><p className="sub">Choose Customize to drag widgets into order and pick a size for each.</p></div>
+      <div><h1>Welcome back, {s.name}</h1></div>
       <div className="acts">
         {edit&&<>
           <select aria-label="Widget type" value={add} onChange={e=>setAdd(e.target.value as Kind)}>
@@ -123,7 +141,7 @@ export default function Overview({s}:{s:Sess}){
     {ws.filter(vis).length===0&&<div className="empty"><h2>No widgets yet</h2><p>Choose Customize to add your first one.</p></div>}
     <div ref={gridRef} className={`wgrid${edit?' edit':''}`} onDragOver={e=>{if(!drag)return;e.preventDefault();hover(e)}}>
       {ws.map((w,i)=>vis(w)&&<section key={w.id} data-id={w.id} data-title={w.title}
-        className={`card sz-${w.size}${drag===w.id?' dragging':''}${gone===w.id?' leaving':''}`}
+        className={`card sz-${w.size} k-${w.kind}${drag===w.id?' dragging':''}${gone===w.id?' leaving':''}`}
         onDrop={e=>e.preventDefault()}>
         <h2>{edit?<input aria-label="Widget title" value={w.title} onChange={e=>set(w.id,{title:e.target.value})}/>:w.title}</h2>
         {body(w)}
@@ -131,8 +149,10 @@ export default function Overview({s}:{s:Sess}){
           <span className="handle" draggable
             onDragStart={(e:DragEvent<HTMLElement>)=>{setDrag(w.id);e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain',w.id);e.dataTransfer.setDragImage(NOGHOST,0,0)}}
             onDragEnd={()=>setDrag(null)}>Drag to sort</span>
-          <select aria-label="Size" value={w.size} onChange={e=>set(w.id,{size:e.target.value as Size})}>{SIZES.map(([z,l])=><option key={z} value={z}>{l}</option>)}</select>
-          {w.kind==='week'&&<select aria-label="Style" value={w.style??'bar'} onChange={e=>set(w.id,{style:e.target.value as W['style']})}><option value="bar">Bar</option><option value="line">Line</option><option value="radar">Radar</option></select>}
+          {w.kind!=='divider'&&<select aria-label="Size" value={w.size} onChange={e=>set(w.id,{size:e.target.value as Size})}>{SIZES.map(([z,l])=><option key={z} value={z}>{l}</option>)}</select>}
+          {w.kind === 'week' && <select aria-label="Style" value={w.style ?? 'bar'} onChange={e => set(w.id, { style: e.target.value as W['style'] })}><option value="bar">Bar</option><option value="line">Line</option><option value="radar">Radar</option></select>}
+          {(w.kind==='pie'||w.kind==='spend')&&<select aria-label="Style" value={w.style??'pie'} onChange={e=>set(w.id,{style:e.target.value as W['style']})}><option value="pie">Pie</option><option value="line">Line</option></select>}
+          {(w.kind==='walletcard'||w.kind==='bankcard')&&<select aria-label="Account" value={w.acc??''} onChange={e=>set(w.id,{acc:e.target.value?+e.target.value:undefined})}><option value="">Choose account</option>{acs.filter(a=>a.kind===(w.kind==='walletcard'?'Wallet':'Bank')).map(a=><option key={a.id} value={a.id}>{a.name}</option>)}</select>}
           <button className="btn o" onClick={()=>move(i,-1)}>Earlier</button>
           <button className="btn o" onClick={()=>move(i,1)}>Later</button>
           <button className="btn o" onClick={()=>remove(w)}>Remove</button>

@@ -18,7 +18,7 @@ export function Pie({data,fmt}:{data:Slice[];fmt:(n:number)=>string}){
   </div>;
 }
 
-export function Line({values,labels}:{values:number[];labels:string[]}){
+export function Line({values,labels,fmt}:{values:number[];labels:string[];fmt?:(n:number)=>string}){
   if(values.length<2)return null;
   const mx=Math.max(...values,1),n=values.length;
   const pts=values.map((v,i)=>`${i/(n-1)*100} ${46-v/mx*40}`);
@@ -27,7 +27,7 @@ export function Line({values,labels}:{values:number[];labels:string[]}){
       <path d={`M0 50L${pts.join('L')}L100 50Z`} fill="var(--ac)" opacity=".15"/>
       <path d={`M${pts.join('L')}`} fill="none" stroke="var(--ac)" strokeWidth="2.5" vectorEffect="non-scaling-stroke" strokeLinejoin="round"/>
     </svg>
-    <div className="xl">{labels.map((l,i)=><span key={i}>{l}</span>)}</div>
+    <div className="xl">{labels.map((l,i)=><span key={i}>{l}{fmt&&<><br/><b>{fmt(values[i])}</b></>}</span>)}</div>
   </div>;
 }
 

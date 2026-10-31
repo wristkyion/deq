@@ -209,3 +209,26 @@ main{overflow-y:auto}
 /* pie chart: grow in instead of spinning, so it never overflows the page */
 @keyframes spin{from{transform:scale(.8);opacity:0}to{transform:none;opacity:1}}
 main{overflow-x:hidden}
+/* ---- more widgets ---- */
+.k-divider{grid-column:1/-1}
+.k-heading{justify-content:center}
+.sep{border:0;border-top:1px solid var(--bd);margin:auto 0;width:100%}
+.wgrid:not(.edit) .card.k-divider,.wgrid:not(.edit) .card.k-heading{background:transparent;border-color:transparent}
+.wgrid:not(.edit) .card.k-divider:hover,.wgrid:not(.edit) .card.k-heading:hover{transform:none;border-color:transparent}
+.wgrid:not(.edit) .k-divider h2{display:none}
+.wgrid:not(.edit) .k-heading h2{font-size:24px;font-weight:600;color:var(--tx)}
+.cal{flex:1;min-height:0;display:flex;flex-direction:column;gap:8px}
+.cal-g{flex:1;min-height:0;display:grid;grid-template-columns:repeat(7,1fr);grid-auto-rows:1fr;gap:2px;font-size:13px}
+.cal-g span{display:flex;align-items:center;justify-content:center;border-radius:8px}
+.cal-g .h{color:var(--mut);font-size:12px}
+.cal-g .t{background:var(--ac);color:#fff;font-weight:500}
+.xl span{text-align:center}
+.xl b{color:var(--tx);font-weight:500}
+.bcard{position:relative;overflow:hidden;flex:1;min-height:0;align-self:center;aspect-ratio:1.586;max-width:100%;padding:14px;border-radius:16px;color:#fff;display:flex;flex-direction:column;justify-content:space-between;background:linear-gradient(135deg,var(--ac),color-mix(in srgb,var(--ac) 50%,#000))}
+.bcard.walletcard{background:linear-gradient(225deg,var(--ac),color-mix(in srgb,var(--ac) 50%,#000))}
+.bcard::after{content:"";position:absolute;right:-36px;top:-36px;width:130px;height:130px;border-radius:50%;background:rgba(255,255,255,.12);pointer-events:none}
+.bcard .split{font-size:12px;opacity:.9;flex-wrap:nowrap}
+.bcard .chip{display:block;width:28px;height:20px;border-radius:5px;background:linear-gradient(135deg,#f3d58a,#c9a24d)}
+.bcard>div:last-child{display:flex;flex-direction:column;gap:2px;font-size:13px;min-width:0}
+.bcard>div:last-child span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bcard .big{font-size:22px}
