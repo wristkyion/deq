@@ -1,0 +1,321 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod crypto;
+use base64::{engine::general_purpose::STANDARD as B, Engine};
+use crypto::*;
+use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::{fs, path::{Path, PathBuf}, sync::Mutex};
+use tauri::State;
+
+type R<T> = Result<T, String>;
+fn e<E: ToString>(x: E) -> String { x.to_string() }
+
+// ---- Data model. Ownership: profile.json = name, modules, lock blob. Everything else is encrypted. ----
+#[derive(Serialize, Deserialize, Clone)]
+struct Lock { salt: String, pw: String, rsalt: String, rk: String } // pw/rk = data key wrapped by password / recovery key
+#[derive(Serialize, Deserialize, Clone, Copy)]
+struct Mods { github: bool, commissions: bool }
+#[derive(Serialize, Deserialize, Clone)]
+struct Meta { id: String, name: String, modules: Mods, lock: Option<Lock> }
+#[derive(Serialize)] struct Info { id: String, name: String, locked: bool }
+#[derive(Serialize)] struct Opened { name: String, modules: Mods, locked: bool }
+#[derive(Serialize)] struct Created { id: String, recovery: Option<String> }
+#[derive(Serialize)] struct Acc { id: i64, name: String, kind: String, balance_cents: i64 }
+#[derive(Serialize)] struct Stats { balance_cents: i64, week: Vec<i64> }
+
+struct Session { id: String, dek: Key, dir: PathBuf }
+struct App { root: PathBuf, s: Mutex<Option<Session>> }
+
+// ---- Helpers ----
+/// Portable mode: next to deq.exe when writable (user/, config/), otherwise %LOCALAPPDATA%\Deq.
+fn data_root() -> PathBuf {
+    if let Some(d) = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
+        if fs::create_dir_all(d.join("user")).is_ok() && fs::write(d.join("user/.w"), b"").is_ok() {
+            let _ = fs::remove_file(d.join("user/.w"));
+            return d;
+        }
+    }
+    PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into())).join("Deq")
+}
+/// Profile folders are named by UUID, never by the editable name. Rejects anything else (path traversal).
+fn pdir(a: &App, id: &str) -> R<PathBuf> {
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_hexdigit() || c == '-') { return Err("Bad profile id".into()); }
+    Ok(a.root.join("user").join(id))
+}
+fn read_meta(d: &Path) -> R<Meta> { serde_json::from_slice(&fs::read(d.join("profile.json")).map_err(e)?).map_err(e) }
+fn write_atomic(p: &Path, b: &[u8]) -> R<()> { let t = p.with_extension("tmp"); fs::write(&t, b).map_err(e)?; fs::rename(&t, p).map_err(e) }
+fn save_meta(d: &Path, m: &Meta) -> R<()> { write_atomic(&d.join("profile.json"), &serde_json::to_vec_pretty(m).map_err(e)?) }
+fn b64(x: &[u8]) -> String { B.encode(x) }
+fn unb(s: &str) -> R<Vec<u8>> { B.decode(s).map_err(e) }
+fn entry(id: &str) -> R<keyring::Entry> { keyring::Entry::new("Deq", id).map_err(e) }
+
+fn fmt_key(k: &str) -> String { k.as_bytes().chunks(4).map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>().join("-") }
+/// Wraps the data key twice: once with the password, once with a fresh random recovery key.
+fn make_lock(dek: &Key, pw: &str) -> R<(Lock, String)> {
+    if pw.chars().count() < 6 { return Err("Use at least 6 characters".into()); }
+    let rec = data_encoding::BASE32_NOPAD.encode(&rnd::<20>());
+    let (s1, s2) = (rnd::<16>(), rnd::<16>());
+    let l = Lock {
+        salt: b64(&s1), pw: b64(&seal(&kdf(pw.as_bytes(), &s1)?, dek)?),
+        rsalt: b64(&s2), rk: b64(&seal(&kdf(rec.as_bytes(), &s2)?, dek)?),
+    };
+    Ok((l, fmt_key(&rec)))
+}
+fn unwrap_dek(l: &Lock, secret: &str, recovery: bool) -> R<Key> {
+    let (salt, blob) = if recovery { (&l.rsalt, &l.rk) } else { (&l.salt, &l.pw) };
+    let secret: String = if recovery { secret.chars().filter(|ch| ch.is_ascii_alphanumeric()).collect::<String>().to_uppercase() } else { secret.to_string() };
+    let v = open(&kdf(secret.as_bytes(), &unb(salt)?)?, &unb(blob)?)?;
+    v.try_into().map_err(|_| "Corrupt key".to_string())
+}
+
+fn migrate(c: &Connection) -> R<()> {
+    let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).map_err(e)?;
+    if v < 1 {
+        // Balance = opening_cents + SUM(tx.amount_cents). Positive = money in, negative = money out.
+        c.execute_batch("BEGIN;
+            CREATE TABLE accounts(id INTEGER PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL, opening_cents INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE tx(id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, amount_cents INTEGER NOT NULL, note TEXT, at INTEGER NOT NULL);
+            CREATE INDEX tx_acc ON tx(account_id);
+            CREATE TABLE time_entries(id INTEGER PRIMARY KEY, project TEXT NOT NULL, note TEXT, start_ts INTEGER NOT NULL, end_ts INTEGER NOT NULL CHECK(end_ts > start_ts));
+            CREATE INDEX te_start ON time_entries(start_ts);
+            PRAGMA user_version = 1; COMMIT;").map_err(e)?;
+    }
+    Ok(())
+}
+/// Opens the active profile's encrypted personal.db (SQLCipher raw key).
+fn db(a: &App) -> R<Connection> {
+    let g = a.s.lock().map_err(e)?;
+    let s = g.as_ref().ok_or("Profile is locked")?;
+    let c = Connection::open(s.dir.join("personal.db")).map_err(e)?;
+    c.execute_batch(&format!("PRAGMA key=\"x'{}'\"; PRAGMA foreign_keys=ON;", hex(&s.dek))).map_err(e)?;
+    migrate(&c)?;
+    Ok(c)
+}
+
+// ---- App config (config/app.json: theme, accent, animation, last profile). Not sensitive. ----
+#[tauri::command]
+fn cfg_get(a: State<App>) -> Value {
+    fs::read(a.root.join("config/app.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(serde_json::json!({}))
+}
+#[tauri::command]
+fn cfg_set(a: State<App>, v: Value) -> R<()> {
+    let d = a.root.join("config"); fs::create_dir_all(&d).map_err(e)?;
+    write_atomic(&d.join("app.json"), &serde_json::to_vec_pretty(&v).map_err(e)?)
+}
+
+// ---- Profiles ----
+#[tauri::command]
+fn profiles(a: State<App>) -> Vec<Info> {
+    let mut v: Vec<Info> = fs::read_dir(a.root.join("user")).into_iter().flatten().flatten()
+        .filter_map(|d| read_meta(&d.path()).ok())
+        .map(|m| Info { id: m.id, name: m.name, locked: m.lock.is_some() }).collect();
+    v.sort_by(|x, y| x.name.to_lowercase().cmp(&y.name.to_lowercase()));
+    v
+}
+#[tauri::command]
+fn create_profile(a: State<App>, name: String, password: Option<String>, modules: Mods) -> R<Created> {
+    let name = name.trim().to_string();
+    if name.is_empty() || name.chars().count() > 40 { return Err("Enter a profile name (up to 40 characters)".into()); }
+    let dek = rnd::<32>();
+    let (lock, rec) = match password.filter(|p| !p.is_empty()) {
+        Some(p) => { let (l, r) = make_lock(&dek, &p)?; (Some(l), Some(r)) }
+        None => (None, None),
+    };
+    let id = uuid::Uuid::new_v4().to_string();
+    let d = pdir(&a, &id)?;
+    fs::create_dir_all(&d).map_err(e)?;
+    if lock.is_none() { entry(&id)?.set_password(&hex(&dek)).map_err(e)?; } // no password: key lives in Windows Credential Manager
+    save_meta(&d, &Meta { id: id.clone(), name, modules, lock })?;
+    Ok(Created { id, recovery: rec })
+}
+#[tauri::command]
+fn open_profile(a: State<App>, id: String, password: Option<String>) -> R<Opened> {
+    let d = pdir(&a, &id)?;
+    let m = read_meta(&d)?;
+    let dek = match &m.lock {
+        Some(l) => unwrap_dek(l, &password.unwrap_or_default(), false)?,
+        None => {
+            let h = entry(&id)?.get_password().map_err(|_| "This profile can’t be opened on this PC without its password. Restore it from a backup.".to_string())?;
+            unhex(&h).ok_or("Corrupt key")?
+        }
+    };
+    *a.s.lock().map_err(e)? = Some(Session { id, dek, dir: d });
+    db(&a)?; // creates / migrates personal.db
+    Ok(Opened { name: m.name, modules: m.modules, locked: m.lock.is_some() })
+}
+#[tauri::command]
+fn lock_now(a: State<App>) { if let Ok(mut g) = a.s.lock() { *g = None; } }
+
+#[tauri::command]
+fn set_password(a: State<App>, password: String) -> R<String> {
+    let g = a.s.lock().map_err(e)?; let s = g.as_ref().ok_or("Profile is locked")?;
+    let mut m = read_meta(&s.dir)?;
+    if m.lock.is_some() { return Err("A password is already set".into()); }
+    let (l, r) = make_lock(&s.dek, &password)?;
+    m.lock = Some(l); save_meta(&s.dir, &m)?;
+    let _ = entry(&s.id)?.delete_credential();
+    Ok(r) // new recovery key, shown once
+}
+#[tauri::command]
+fn remove_password(a: State<App>, current: String) -> R<()> {
+    let g = a.s.lock().map_err(e)?; let s = g.as_ref().ok_or("Profile is locked")?;
+    let mut m = read_meta(&s.dir)?;
+    let l = m.lock.clone().ok_or("No password is set")?;
+    unwrap_dek(&l, &current, false)?; // must know the current password
+    entry(&s.id)?.set_password(&hex(&s.dek)).map_err(e)?;
+    m.lock = None; save_meta(&s.dir, &m)
+}
+/// Forgot password: unwrap the data key with the recovery key, set a new password, issue a NEW recovery key.
+#[tauri::command]
+fn recover(a: State<App>, id: String, recovery: String, password: String) -> R<String> {
+    let d = pdir(&a, &id)?; let mut m = read_meta(&d)?;
+    let l = m.lock.clone().ok_or("This profile has no password")?;
+    let dek = unwrap_dek(&l, &recovery, true)?;
+    let (nl, nr) = make_lock(&dek, &password)?;
+    m.lock = Some(nl); save_meta(&d, &m)?;
+    Ok(nr)
+}
+#[tauri::command]
+fn set_module(a: State<App>, name: String, on: bool) -> R<()> {
+    let g = a.s.lock().map_err(e)?; let s = g.as_ref().ok_or("Profile is locked")?;
+    let mut m = read_meta(&s.dir)?;
+    match name.as_str() { "github" => m.modules.github = on, "commissions" => m.modules.commissions = on, _ => return Err("Unknown module".into()) }
+    save_meta(&s.dir, &m)
+}
+
+// ---- dashboard.json (encrypted with the profile key) ----
+#[tauri::command]
+fn dashboard_get(a: State<App>) -> R<String> {
+    let g = a.s.lock().map_err(e)?; let s = g.as_ref().ok_or("Profile is locked")?;
+    match fs::read(s.dir.join("dashboard.json")) {
+        Ok(b) => String::from_utf8(open(&s.dek, &b)?).map_err(e),
+        Err(_) => Ok(String::new()),
+    }
+}
+#[tauri::command]
+fn dashboard_set(a: State<App>, json: String) -> R<()> {
+    let g = a.s.lock().map_err(e)?; let s = g.as_ref().ok_or("Profile is locked")?;
+    write_atomic(&s.dir.join("dashboard.json"), &seal(&s.dek, json.as_bytes())?)
+}
+
+// ---- Personal ----
+#[tauri::command]
+fn add_time(a: State<App>, project: String, start: i64, end: i64) -> R<()> {
+    db(&a)?.execute("INSERT INTO time_entries(project,start_ts,end_ts) VALUES(?1,?2,?3)", params![project, start, end]).map_err(e)?; Ok(())
+}
+#[tauri::command]
+fn add_account(a: State<App>, name: String, kind: String, opening_cents: i64) -> R<()> {
+    db(&a)?.execute("INSERT INTO accounts(name,kind,opening_cents) VALUES(?1,?2,?3)", params![name, kind, opening_cents]).map_err(e)?; Ok(())
+}
+#[tauri::command]
+fn add_tx(a: State<App>, account_id: i64, amount_cents: i64, note: String, at: i64) -> R<()> {
+    db(&a)?.execute("INSERT INTO tx(account_id,amount_cents,note,at) VALUES(?1,?2,?3,?4)", params![account_id, amount_cents, note, at]).map_err(e)?; Ok(())
+}
+#[tauri::command]
+fn list_accounts(a: State<App>) -> R<Vec<Acc>> {
+    let c = db(&a)?;
+    let mut st = c.prepare("SELECT a.id,a.name,a.kind,a.opening_cents+COALESCE((SELECT SUM(amount_cents) FROM tx WHERE account_id=a.id),0) FROM accounts a ORDER BY a.name").map_err(e)?;
+    let rows = st.query_map([], |r| Ok(Acc { id: r.get(0)?, name: r.get(1)?, kind: r.get(2)?, balance_cents: r.get(3)? })).map_err(e)?;
+    let v = rows.collect::<Result<Vec<_>, _>>().map_err(e)?;
+    Ok(v)
+}
+/// week_start = unix seconds of local Monday 00:00. Returns seconds tracked per day, Mon..Sun.
+#[tauri::command]
+fn stats(a: State<App>, week_start: i64) -> R<Stats> {
+    let c = db(&a)?;
+    let balance_cents: i64 = c.query_row("SELECT COALESCE(SUM(opening_cents),0)+COALESCE((SELECT SUM(amount_cents) FROM tx),0) FROM accounts", [], |r| r.get(0)).map_err(e)?;
+    let mut week = vec![];
+    for i in 0..7 {
+        let (f, t) = (week_start + i * 86400, week_start + (i + 1) * 86400);
+        week.push(c.query_row("SELECT COALESCE(SUM(MAX(0,MIN(end_ts,?2)-MAX(start_ts,?1))),0) FROM time_entries WHERE end_ts>?1 AND start_ts<?2", params![f, t], |r| r.get::<_, i64>(0)).map_err(e)?);
+    }
+    Ok(Stats { balance_cents, week })
+}
+
+#[derive(Serialize)] struct TxRow { id: i64, account: String, amount_cents: i64, note: String, at: i64 }
+#[derive(Serialize)] struct TimeRow { id: i64, project: String, start: i64, end: i64 }
+#[derive(Serialize)] struct Summary { spent_cents: i64, income_cents: i64 }
+
+#[tauri::command]
+fn list_tx(a: State<App>, limit: i64) -> R<Vec<TxRow>> {
+    let c = db(&a)?;
+    let mut st = c.prepare("SELECT t.id,a.name,t.amount_cents,COALESCE(t.note,''),t.at FROM tx t JOIN accounts a ON a.id=t.account_id ORDER BY t.at DESC,t.id DESC LIMIT ?1").map_err(e)?;
+    let rows = st.query_map([limit], |r| Ok(TxRow { id: r.get(0)?, account: r.get(1)?, amount_cents: r.get(2)?, note: r.get(3)?, at: r.get(4)? })).map_err(e)?;
+    let v = rows.collect::<Result<Vec<_>, _>>().map_err(e)?;
+    Ok(v)
+}
+#[tauri::command]
+fn list_time(a: State<App>, limit: i64) -> R<Vec<TimeRow>> {
+    let c = db(&a)?;
+    let mut st = c.prepare("SELECT id,project,start_ts,end_ts FROM time_entries ORDER BY end_ts DESC LIMIT ?1").map_err(e)?;
+    let rows = st.query_map([limit], |r| Ok(TimeRow { id: r.get(0)?, project: r.get(1)?, start: r.get(2)?, end: r.get(3)? })).map_err(e)?;
+    let v = rows.collect::<Result<Vec<_>, _>>().map_err(e)?;
+    Ok(v)
+}
+/// Money out (negative) and money in (positive) since `from` (unix seconds).
+#[tauri::command]
+fn spend_summary(a: State<App>, from: i64) -> R<Summary> {
+    db(&a)?.query_row("SELECT COALESCE(-SUM(CASE WHEN amount_cents<0 THEN amount_cents END),0), COALESCE(SUM(CASE WHEN amount_cents>0 THEN amount_cents END),0) FROM tx WHERE at>=?1", [from],
+        |r| Ok(Summary { spent_cents: r.get(0)?, income_cents: r.get(1)? })).map_err(e)
+}
+
+#[derive(Serialize)] struct Slice { label: String, value: i64 }
+
+#[tauri::command]
+fn list_tx_range(a: State<App>, from: i64, to: i64) -> R<Vec<TxRow>> {
+    let c = db(&a)?;
+    let mut st = c.prepare("SELECT t.id,a.name,t.amount_cents,COALESCE(t.note,''),t.at FROM tx t JOIN accounts a ON a.id=t.account_id WHERE t.at>=?1 AND t.at<?2 ORDER BY t.at DESC,t.id DESC").map_err(e)?;
+    let rows = st.query_map(params![from, to], |r| Ok(TxRow { id: r.get(0)?, account: r.get(1)?, amount_cents: r.get(2)?, note: r.get(3)?, at: r.get(4)? })).map_err(e)?;
+    let v = rows.collect::<Result<Vec<_>, _>>().map_err(e)?;
+    Ok(v)
+}
+#[tauri::command]
+fn list_time_range(a: State<App>, from: i64, to: i64) -> R<Vec<TimeRow>> {
+    let c = db(&a)?;
+    let mut st = c.prepare("SELECT id,project,start_ts,end_ts FROM time_entries WHERE start_ts>=?1 AND start_ts<?2 ORDER BY start_ts DESC").map_err(e)?;
+    let rows = st.query_map(params![from, to], |r| Ok(TimeRow { id: r.get(0)?, project: r.get(1)?, start: r.get(2)?, end: r.get(3)? })).map_err(e)?;
+    let v = rows.collect::<Result<Vec<_>, _>>().map_err(e)?;
+    Ok(v)
+}
+/// Seconds tracked per project, largest first.
+#[tauri::command]
+fn project_totals(a: State<App>) -> R<Vec<Slice>> {
+    let c = db(&a)?;
+    let mut st = c.prepare("SELECT project,SUM(end_ts-start_ts) AS s FROM time_entries GROUP BY project ORDER BY s DESC").map_err(e)?;
+    let rows = st.query_map([], |r| Ok(Slice { label: r.get(0)?, value: r.get(1)? })).map_err(e)?;
+    let v = rows.collect::<Result<Vec<_>, _>>().map_err(e)?;
+    Ok(v)
+}
+/// Money out (in cents) per account since `from`.
+#[tauri::command]
+fn spend_by_account(a: State<App>, from: i64) -> R<Vec<Slice>> {
+    let c = db(&a)?;
+    let mut st = c.prepare("SELECT a.name,-SUM(t.amount_cents) AS s FROM tx t JOIN accounts a ON a.id=t.account_id WHERE t.amount_cents<0 AND t.at>=?1 GROUP BY a.id ORDER BY s DESC").map_err(e)?;
+    let rows = st.query_map([from], |r| Ok(Slice { label: r.get(0)?, value: r.get(1)? })).map_err(e)?;
+    let v = rows.collect::<Result<Vec<_>, _>>().map_err(e)?;
+    Ok(v)
+}
+/// Permanently removes a profile folder. A password-protected profile needs its password.
+#[tauri::command]
+fn delete_profile(a: State<App>, id: String, password: Option<String>) -> R<()> {
+    let d = pdir(&a, &id)?;
+    let m = read_meta(&d)?;
+    if let Some(l) = &m.lock { unwrap_dek(l, &password.unwrap_or_default(), false)?; }
+    {
+        let mut g = a.s.lock().map_err(e)?;
+        if g.as_ref().map_or(false, |s| s.id == id) { *g = None; }
+    }
+    let _ = entry(&id).and_then(|en| en.delete_credential().map_err(e));
+    fs::remove_dir_all(&d).map_err(e)
+}
+
+fn main() {
+    let root = data_root();
+    let _ = fs::create_dir_all(root.join("user"));
+    tauri::Builder::default()
+        .manage(App { root, s: Mutex::new(None) })
+        .invoke_handler(tauri::generate_handler![cfg_get, cfg_set, profiles, create_profile, open_profile, lock_now, set_password, remove_password, recover, set_module, dashboard_get, dashboard_set, add_time, add_account, add_tx, list_accounts, stats, list_tx, list_time, spend_summary, list_tx_range, list_time_range, project_totals, spend_by_account, delete_profile])
+        .run(tauri::generate_context!())
+        .expect("failed to start Deq");
+}
