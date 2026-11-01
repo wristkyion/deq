@@ -5,21 +5,23 @@ use crypto::*;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{fs, path::{Path, PathBuf}, sync::Mutex};
+use std::{fs, path::{Path, PathBuf}, sync::Mutex, time::{SystemTime, UNIX_EPOCH}};
 use tauri::State;
 
 type R<T> = Result<T, String>;
 fn e<E: ToString>(x: E) -> String { x.to_string() }
 
-// ---- Data model. Ownership: profile.json = name, modules, lock blob. Everything else is encrypted. ----
+// ---- Data model. Ownership: profile.json = name, modules, lock blob, currency, week start. Everything else is encrypted. ----
 #[derive(Serialize, Deserialize, Clone)]
 struct Lock { salt: String, pw: String, rsalt: String, rk: String } // pw/rk = data key wrapped by password / recovery key
 #[derive(Serialize, Deserialize, Clone, Copy)]
 struct Mods { github: bool, commissions: bool }
+fn d_cur() -> String { "USD".into() }
+fn d_week() -> u8 { 1 } // 1 = Monday, 0 = Sunday
 #[derive(Serialize, Deserialize, Clone)]
-struct Meta { id: String, name: String, modules: Mods, lock: Option<Lock> }
+struct Meta { id: String, name: String, modules: Mods, lock: Option<Lock>, #[serde(default = "d_cur")] currency: String, #[serde(default = "d_week")] week_start: u8 }
 #[derive(Serialize)] struct Info { id: String, name: String, locked: bool }
-#[derive(Serialize)] struct Opened { name: String, modules: Mods, locked: bool }
+#[derive(Serialize)] struct Opened { name: String, modules: Mods, locked: bool, currency: String, week_start: u8 }
 #[derive(Serialize)] struct Created { id: String, recovery: Option<String> }
 #[derive(Serialize)] struct Acc { id: i64, name: String, kind: String, balance_cents: i64 }
 #[derive(Serialize)] struct Stats { balance_cents: i64, week: Vec<i64> }
@@ -99,7 +101,7 @@ fn db(a: &App) -> R<Connection> {
     Ok(c)
 }
 
-// ---- App config (config/app.json: theme, accent, animation, last profile). Not sensitive. ----
+// ---- App config (config/app.json: theme, accent, animation, last profile, auto-lock). Not sensitive. ----
 #[tauri::command]
 fn cfg_get(a: State<App>) -> Value {
     fs::read(a.root.join("config/app.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(serde_json::json!({}))
@@ -132,7 +134,7 @@ fn create_profile(a: State<App>, name: String, password: Option<String>, modules
     let d = pdir(&a, &id)?;
     fs::create_dir_all(&d).map_err(e)?;
     if lock.is_none() { entry(&id)?.set_password(&hex(&dek)).map_err(e)?; } // no password: key lives in Windows Credential Manager
-    save_meta(&d, &Meta { id: id.clone(), name, modules, lock })?;
+    save_meta(&d, &Meta { id: id.clone(), name, modules, lock, currency: d_cur(), week_start: d_week() })?;
     Ok(Created { id, recovery: rec })
 }
 #[tauri::command]
@@ -148,7 +150,7 @@ fn open_profile(a: State<App>, id: String, password: Option<String>) -> R<Opened
     };
     *a.s.lock().map_err(e)? = Some(Session { id, dek, dir: d });
     db(&a)?; // creates / migrates personal.db
-    Ok(Opened { name: m.name, modules: m.modules, locked: m.lock.is_some() })
+    Ok(Opened { name: m.name, modules: m.modules, locked: m.lock.is_some(), currency: m.currency, week_start: m.week_start })
 }
 #[tauri::command]
 fn lock_now(a: State<App>) { if let Ok(mut g) = a.s.lock() { *g = None; } }
@@ -189,6 +191,113 @@ fn set_module(a: State<App>, name: String, on: bool) -> R<()> {
     match name.as_str() { "github" => m.modules.github = on, "commissions" => m.modules.commissions = on, _ => return Err("Unknown module".into()) }
     save_meta(&s.dir, &m)
 }
+/// Renames any profile (the name is only a label, the folder stays named by its UUID).
+#[tauri::command]
+fn rename_profile(a: State<App>, id: String, name: String) -> R<()> {
+    let name = name.trim().to_string();
+    if name.is_empty() || name.chars().count() > 40 { return Err("Enter a profile name (up to 40 characters)".into()); }
+    let d = pdir(&a, &id)?;
+    let mut m = read_meta(&d)?;
+    m.name = name;
+    save_meta(&d, &m)
+}
+const CURS: [&str; 9] = ["USD", "EUR", "GBP", "JPY", "IDR", "SGD", "MYR", "AUD", "CAD"];
+/// Currency and week start of the active profile (stored in its profile.json). Amounts are not converted.
+#[tauri::command]
+fn set_prefs(a: State<App>, currency: String, week_start: u8) -> R<()> {
+    if !CURS.contains(&currency.as_str()) { return Err("Unknown currency".into()); }
+    if week_start > 1 { return Err("Unknown week start".into()); }
+    let g = a.s.lock().map_err(e)?; let s = g.as_ref().ok_or("Profile is locked")?;
+    let mut m = read_meta(&s.dir)?;
+    m.currency = currency; m.week_start = week_start;
+    save_meta(&s.dir, &m)
+}
+#[tauri::command]
+fn about_info(a: State<App>) -> Value {
+    serde_json::json!({ "version": env!("CARGO_PKG_VERSION"), "path": a.root.to_string_lossy().to_string() })
+}
+
+// ---- Backup: one file holding the encrypted data plus the data key, sealed with a backup password ----
+#[derive(Serialize, Deserialize)]
+struct Bak { v: u8, name: String, modules: Mods, currency: String, week_start: u8, salt: String, blob: String }
+#[derive(Serialize, Deserialize)]
+struct BakData { dek: String, db: String, dash: Option<String> }
+#[derive(Serialize)] struct BakInfo { file: String, name: String, at: u64, size: u64 }
+
+/// UTC date as YYYY-MM-DD from unix seconds.
+fn ymd(secs: u64) -> String {
+    let z = (secs / 86400) as i64 + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    format!("{:04}-{:02}-{:02}", yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d)
+}
+#[tauri::command]
+fn export_backup(a: State<App>, password: String) -> R<String> {
+    if password.chars().count() < 6 { return Err("Use at least 6 characters for the backup password".into()); }
+    let (dir, dek) = { let g = a.s.lock().map_err(e)?; let s = g.as_ref().ok_or("Profile is locked")?; (s.dir.clone(), s.dek) };
+    let m = read_meta(&dir)?;
+    let data = BakData {
+        dek: hex(&dek),
+        db: b64(&fs::read(dir.join("personal.db")).map_err(e)?),
+        dash: fs::read(dir.join("dashboard.json")).ok().map(|b| b64(&b)),
+    };
+    let salt = rnd::<16>();
+    let blob = seal(&kdf(password.as_bytes(), &salt)?, &serde_json::to_vec(&data).map_err(e)?)?;
+    let bak = Bak { v: 1, name: m.name.clone(), modules: m.modules, currency: m.currency.clone(), week_start: m.week_start, salt: b64(&salt), blob: b64(&blob) };
+    let d = a.root.join("backups"); fs::create_dir_all(&d).map_err(e)?;
+    let safe: String = m.name.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map_err(e)?.as_secs();
+    let f = d.join(format!("{}-{}-{:02}{:02}.deqbackup", safe, ymd(secs), secs % 86400 / 3600, secs % 3600 / 60));
+    if f.exists() { return Err("A backup was already saved this minute. Try again in a minute".into()); }
+    write_atomic(&f, &serde_json::to_vec(&bak).map_err(e)?)?;
+    Ok(f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default())
+}
+#[tauri::command]
+fn list_backups(a: State<App>) -> Vec<BakInfo> {
+    let mut v: Vec<BakInfo> = fs::read_dir(a.root.join("backups")).into_iter().flatten().flatten()
+        .filter(|d| d.path().extension().map_or(false, |x| x == "deqbackup"))
+        .filter_map(|d| {
+            let md = d.metadata().ok()?;
+            let b: Bak = serde_json::from_slice(&fs::read(d.path()).ok()?).ok()?;
+            Some(BakInfo { file: d.file_name().to_string_lossy().to_string(), name: b.name, at: md.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_secs(), size: md.len() })
+        }).collect();
+    v.sort_by(|x, y| y.at.cmp(&x.at));
+    v
+}
+/// Restores a backup as a NEW profile (new UUID). An optional password protects it and issues a recovery key.
+#[tauri::command]
+fn import_backup(a: State<App>, file: String, backup_password: String, password: Option<String>) -> R<Created> {
+    if file.contains('/') || file.contains('\\') || file.contains("..") || !file.ends_with(".deqbackup") { return Err("Bad backup file".into()); }
+    let bak: Bak = serde_json::from_slice(&fs::read(a.root.join("backups").join(&file)).map_err(e)?).map_err(|_| "This is not a Deq backup".to_string())?;
+    if bak.v != 1 { return Err("This backup was made by a newer Deq".into()); }
+    let raw = open(&kdf(backup_password.as_bytes(), &unb(&bak.salt)?)?, &unb(&bak.blob)?).map_err(|_| "Wrong backup password".to_string())?;
+    let data: BakData = serde_json::from_slice(&raw).map_err(|_| "Corrupt backup".to_string())?;
+    let dek = unhex(&data.dek).ok_or("Corrupt backup")?;
+    let (lock, rec) = match password.filter(|p| !p.is_empty()) {
+        Some(p) => { let (l, r) = make_lock(&dek, &p)?; (Some(l), Some(r)) }
+        None => (None, None),
+    };
+    let id = uuid::Uuid::new_v4().to_string();
+    let d = pdir(&a, &id)?;
+    fs::create_dir_all(&d).map_err(e)?;
+    let put = || -> R<()> {
+        fs::write(d.join("personal.db"), unb(&data.db)?).map_err(e)?;
+        if let Some(x) = &data.dash { write_atomic(&d.join("dashboard.json"), &unb(x)?)?; }
+        if lock.is_none() { entry(&id)?.set_password(&hex(&dek)).map_err(e)?; }
+        save_meta(&d, &Meta { id: id.clone(), name: format!("{} (imported)", bak.name), modules: bak.modules, lock: lock.clone(), currency: bak.currency.clone(), week_start: bak.week_start })
+    };
+    if let Err(x) = put() { // leave nothing half-restored
+        let _ = fs::remove_dir_all(&d);
+        let _ = entry(&id).and_then(|en| en.delete_credential().map_err(e));
+        return Err(x);
+    }
+    Ok(Created { id, recovery: rec })
+}
 
 // ---- dashboard.json (encrypted with the profile key) ----
 #[tauri::command]
@@ -227,7 +336,7 @@ fn list_accounts(a: State<App>) -> R<Vec<Acc>> {
     let v = rows.collect::<Result<Vec<_>, _>>().map_err(e)?;
     Ok(v)
 }
-/// week_start = unix seconds of local Monday 00:00. Returns seconds tracked per day, Mon..Sun.
+/// week_start = unix seconds of the local first day of the week 00:00. Returns seconds tracked per day, first day first.
 #[tauri::command]
 fn stats(a: State<App>, week_start: i64) -> R<Stats> {
     let c = db(&a)?;
@@ -383,7 +492,7 @@ fn main() {
     let _ = fs::create_dir_all(root.join("user"));
     tauri::Builder::default()
         .manage(App { root, s: Mutex::new(None) })
-        .invoke_handler(tauri::generate_handler![cfg_get, cfg_set, profiles, create_profile, open_profile, lock_now, set_password, remove_password, recover, set_module, dashboard_get, dashboard_set, add_time, add_account, add_tx, list_accounts, stats, list_tx, list_time, spend_summary, list_tx_range, list_time_range, project_totals, spend_by_account, delete_profile, spend_by_category, finance_sum, list_categories, add_transfer, delete_tx, delete_time, delete_account])
+        .invoke_handler(tauri::generate_handler![cfg_get, cfg_set, profiles, create_profile, open_profile, lock_now, set_password, remove_password, recover, set_module, dashboard_get, dashboard_set, add_time, add_account, add_tx, list_accounts, stats, list_tx, list_time, spend_summary, list_tx_range, list_time_range, project_totals, spend_by_account, delete_profile, spend_by_category, finance_sum, list_categories, add_transfer, delete_tx, delete_time, delete_account, rename_profile, set_prefs, about_info, export_backup, list_backups, import_backup])
         .run(tauri::generate_context!())
         .expect("failed to start Deq");
 }

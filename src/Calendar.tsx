@@ -1,11 +1,11 @@
 import {useState} from 'react';
-const DAYS='MTWTFSS'.split('');
+import {weekIdx,weekLabels} from './api';
 
 export default function Calendar(){
   const [off,setOff]=useState(0);
   const t=new Date();
   const m=new Date(t.getFullYear(),t.getMonth()+off,1);
-  const lead=(m.getDay()+6)%7;
+  const lead=weekIdx(m);
   const len=new Date(m.getFullYear(),m.getMonth()+1,0).getDate();
   const days=[...Array<number>(lead).fill(0),...Array.from({length:len},(_,i)=>i+1)];
   return <div className="cal">
@@ -18,7 +18,7 @@ export default function Calendar(){
       </div>
     </div>
     <div className="cal-g">
-      {DAYS.map((d,i)=><span className="h" key={'h'+i}>{d}</span>)}
+      {weekLabels().map((d,i)=><span className="h" key={'h'+i}>{d}</span>)}
       {days.map((d,i)=><span key={i} className={off===0&&d===t.getDate()?'t':undefined}>{d||''}</span>)}
     </div>
   </div>;

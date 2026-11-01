@@ -1,5 +1,5 @@
 import {FormEvent,useEffect,useState} from 'react';
-import {api,clock,dur,now,Slice,TimeRow} from './api';
+import {api,clock,dur,now,Slice,TimeRow,weekIdx,weekStart} from './api';
 import Dialog,{Actions} from './Dialog';
 import { useToast } from './Toast';
 import RemoveBtn from './RemoveBtn';
@@ -11,9 +11,7 @@ export default function Activity(){
   const [projs,setProjs]=useState<Slice[]>([]);
   const [week,setWeek]=useState<number[]>([]);
   const load=()=>{
-    const d=new Date();
-    const mon=new Date(d.getFullYear(),d.getMonth(),d.getDate()-((d.getDay()+6)%7));
-    Promise.all([api.times(100),api.projects(),api.stats(Math.floor(mon.getTime()/1000))])
+    Promise.all([api.times(100),api.projects(),api.stats(Math.floor(weekStart().getTime()/1000))])
       .then(([t,p,s])=>{setTimes(t);setProjs(p);setWeek(s.week)}).catch(toast.error);
   };
   useEffect(()=>{load()},[]);
@@ -24,7 +22,7 @@ export default function Activity(){
   };
   const total=projs.reduce((a,p)=>a+p.value,0);
   const weekTotal=week.reduce((a,b)=>a+b,0);
-  const today=week[(new Date().getDay()+6)%7]??0;
+  const today=week[weekIdx()]??0;
   const mx=Math.max(...projs.map(p=>p.value),1);
 
   return <div className="fit">
