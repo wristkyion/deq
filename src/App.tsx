@@ -1,5 +1,6 @@
 import {useEffect,useState} from 'react';
-import {api,Cfg,Sess} from './api';
+import {api,applyPrefs,Cfg,Sess} from './api';
+import {useToast} from './Toast';
 import Gate from './Gate';
 import Overview from './Overview';
 import Daily from './Daily';
@@ -18,15 +19,26 @@ export default function App() {
   const [aid,setAid]=useState('');
   const [page,setPage]=useState('overview');
   const [auto,setAuto]=useState(true);
+  const toast=useToast();
+  const mins=cfg?.autolock??0;
   useEffect(()=>{api.cfg().then(c=>setCfg({theme:'system',accent:'#6d4aff',motion:'full',...c}))},[]);
   useEffect(()=>{
     if(!cfg)return;
     const r=document.documentElement;
     r.dataset.theme=cfg.theme;r.dataset.motion=cfg.motion;r.style.setProperty('--ac',cfg.accent);
   },[cfg]);
+  useEffect(()=>{ // auto-lock: back to the profile picker after no activity
+    if(!sess||!mins)return;
+    let t=0;
+    const reset=()=>{clearTimeout(t);t=window.setTimeout(()=>api.lock().then(()=>{setSess(null);toast.info('Locked after inactivity')}),mins*60000)};
+    const ev:string[]=['pointerdown','keydown','wheel','mousemove'];
+    ev.forEach(x=>window.addEventListener(x,reset,{passive:true}));
+    reset();
+    return()=>{clearTimeout(t);ev.forEach(x=>window.removeEventListener(x,reset))};
+  },[sess!==null,mins]);
   if(!cfg)return null;
   const upd=(p:Partial<Cfg>)=>{const n={...cfg,...p};setCfg(n);api.setCfg(n)};
-  if(!sess)return <Gate last={cfg.last} main={cfg.main} auto={auto} onOpen={(s,id)=>{setAuto(false);setAid(id);setSess(s);setPage('overview');upd({last:id})}}/>;
+  if(!sess)return <Gate last={cfg.last} main={cfg.main} auto={auto} onOpen={(s,id)=>{applyPrefs(s.currency,s.week_start);setAuto(false);setAid(id);setSess(s);setPage('overview');upd({last:id})}}/>;
 
   const m=sess.modules;
   const cur=(page.startsWith('gh-')&&!m.github)||(page.startsWith('cm-')&&!m.commissions)?'overview':page;

@@ -1,5 +1,5 @@
 import {DragEvent,useEffect,useLayoutEffect,useRef,useState} from 'react';
-import {Acc,api,day,dur,Fin,kindName,money,Sess,Slice,Stats,TxRow} from './api';
+import {Acc,api,day,dur,Fin,kindName,money,Sess,Slice,Stats,TxRow,weekIdx,weekLabels,weekStart} from './api';
 import Calendar from './Calendar';
 import {Line,Pie,Radar} from './Charts';
 import { useToast } from './Toast';
@@ -41,15 +41,6 @@ export default function Overview({s}:{s:Sess}){
   const prev=useRef(new Map<string,{x:number;y:number;w:number;h:number}>());
   const last=useRef(0); // time of the last reorder, so tiles don't reorder while still sliding
 
-  useLayoutEffect(()=>{ // animate every card from its old position and size to the new one
-    const calm=document.documentElement.dataset.motion==='reduce'||matchMedia('(prefers-reduced-motion: reduce)').matches;
-    gridRef.current?.querySelectorAll<HTMLElement>('[data-id]').forEach(el=>{
-      const id=el.dataset.id!,n={x:el.offsetLeft,y:el.offsetTop,w:el.offsetWidth,h:el.offsetHeight},o=prev.current.get(id);
-      if(o&&!calm&&(o.x!==n.x||o.y!==n.y||o.w!==n.w||o.h!==n.h))
-        el.animate([{transform:`translate(${o.x-n.x}px,${o.y-n.y}px)`,width:`${o.w}px`,height:`${o.h}px`},{transform:'none',width:`${n.w}px`,height:`${n.h}px`}],{duration:140,easing:'ease-out'});
-      prev.current.set(id,n);
-    });
-  });
   useLayoutEffect(()=>{ // size the grid first, so the animation below never sees the fallback layout
     const g=gridRef.current;if(!g)return;
     const fit=()=>{
@@ -62,27 +53,26 @@ export default function Overview({s}:{s:Sess}){
     return()=>ro.disconnect();
   },[ws===null]);
 
+  useLayoutEffect(()=>{ // animate every card from its old position and size to the new one
+    const calm=document.documentElement.dataset.motion==='reduce'||matchMedia('(prefers-reduced-motion: reduce)').matches;
+    gridRef.current?.querySelectorAll<HTMLElement>('[data-id]').forEach(el=>{
+      const id=el.dataset.id!,n={x:el.offsetLeft,y:el.offsetTop,w:el.offsetWidth,h:el.offsetHeight},o=prev.current.get(id);
+      if(o&&!calm&&(o.x!==n.x||o.y!==n.y||o.w!==n.w||o.h!==n.h))
+        el.animate([{transform:`translate(${o.x-n.x}px,${o.y-n.y}px)`,width:`${o.w}px`,height:`${o.h}px`},{transform:'none',width:`${n.w}px`,height:`${n.h}px`}],{duration:140,easing:'ease-out'});
+      prev.current.set(id,n);
+    });
+  });
+
   useEffect(()=>{
     api.dash().then(j=>{try{setWs((j?JSON.parse(j) as W[]:DEF()).map(w=>({...w,size:w.size??(w.wide?'w':'s')})))}catch{setWs(DEF())}}).catch(toast.error);
     const d=new Date();
-    const mon=new Date(d.getFullYear(),d.getMonth(),d.getDate()-((d.getDay()+6)%7));
-    api.stats(Math.floor(mon.getTime()/1000)).then(setSt);
+    api.stats(Math.floor(weekStart().getTime()/1000)).then(setSt);
     api.projects().then(setPr).catch(toast.error);
     api.spendBy(Math.floor(new Date(d.getFullYear(),d.getMonth(),1).getTime()/1000)).then(setSp).catch(toast.error);
     api.txs(6).then(setRc).catch(toast.error);
     api.accounts().then(setAcs).catch(toast.error);
     api.finance(Math.floor(new Date(d.getFullYear(),d.getMonth(),1).getTime()/1000),Math.floor(new Date(d.getFullYear(),d.getMonth(),d.getDate()+1).getTime()/1000)).then(setFn).catch(toast.error);
   }, []);
-  useEffect(()=>{ // size the grid so a Square tile is really square: pick the column count, then use the column width as the row height
-    const g=gridRef.current;if(!g)return;
-    const fit=()=>{
-      const w=g.clientWidth,n=Math.max(1,Math.floor((w+16)/236)),c=(w-(n-1)*16)/n;
-      g.style.setProperty('--cols',String(n));g.style.setProperty('--cell',`${c}px`);
-    };
-    fit();
-    const ro=new ResizeObserver(fit);ro.observe(g);
-    return()=>ro.disconnect();
-  },[ws===null]);
   useEffect(()=>{ // save layout (encrypted by the backend) shortly after each change
     if(!ws)return;
     if(!ready.current){ready.current=true;return}
@@ -114,9 +104,9 @@ export default function Overview({s}:{s:Sess}){
   
   const body=(w:W)=>{switch(w.kind){
     case 'balance':return <><div className="big">{st?money(st.balance_cents):'…'}</div><p className="note">Entered by you. Not synced with any bank.</p></>;
-    case 'today':return <><div className="big">{dur(st?st.week[(new Date().getDay()+6)%7]:0)}</div><p className="note">Recorded today.</p></>;
+    case 'today':return <><div className="big">{dur(st?st.week[weekIdx()]:0)}</div><p className="note">Recorded today.</p></>;
     case 'week':{const wk=st?.week??[];const mx=Math.max(...wk,3600);
-      const L='MTWTFSS'.split('');
+      const L=weekLabels();
       if(w.style==='line')return <Line values={wk} labels={L}/>;
       if(w.style==='radar')return <Radar values={wk} labels={L}/>;
       return <div className="bars">{wk.map((v,i)=><div key={i}><b style={{height:`${v/mx*100}%`}}/>{L[i]}</div>)}</div>}

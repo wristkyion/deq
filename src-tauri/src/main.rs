@@ -5,23 +5,25 @@ use crypto::*;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{fs, path::{Path, PathBuf}, sync::Mutex};
+use std::{fs, path::{Path, PathBuf}, sync::Mutex, time::{SystemTime, UNIX_EPOCH}};
 use tauri::State;
 
 type R<T> = Result<T, String>;
 fn e<E: ToString>(x: E) -> String { x.to_string() }
 
-// ---- Data model. Ownership: profile.json = name, modules, lock blob. Everything else is encrypted. ----
+// ---- Data model. Ownership: profile.json = name, modules, lock blob, currency, week start. Everything else is encrypted. ----
 #[derive(Serialize, Deserialize, Clone)]
 struct Lock { salt: String, pw: String, rsalt: String, rk: String } // pw/rk = data key wrapped by password / recovery key
 #[derive(Serialize, Deserialize, Clone, Copy)]
 struct Mods { github: bool, commissions: bool }
+fn d_cur() -> String { "USD".into() }
+fn d_week() -> u8 { 1 } // 1 = Monday, 0 = Sunday
 #[derive(Serialize, Deserialize, Clone)]
-struct Meta { id: String, name: String, modules: Mods, lock: Option<Lock> }
+struct Meta { id: String, name: String, modules: Mods, lock: Option<Lock>, #[serde(default = "d_cur")] currency: String, #[serde(default = "d_week")] week_start: u8 }
 #[derive(Serialize)] struct Info { id: String, name: String, locked: bool }
-#[derive(Serialize)] struct Opened { name: String, modules: Mods, locked: bool }
+#[derive(Serialize)] struct Opened { name: String, modules: Mods, locked: bool, currency: String, week_start: u8 }
 #[derive(Serialize)] struct Created { id: String, recovery: Option<String> }
-#[derive(Serialize)] struct Acc { id: i64, name: String, kind: String, balance_cents: i64 }
+#[derive(Serialize)] struct Acc { id: i64, name: String, kind: String, balance_cents: i64, opening_cents: i64 }
 #[derive(Serialize)] struct Stats { balance_cents: i64, week: Vec<i64> }
 
 struct Session { id: String, dek: Key, dir: PathBuf }
@@ -87,6 +89,21 @@ fn migrate(c: &Connection) -> R<()> {
             ALTER TABLE tx ADD COLUMN is_transfer INTEGER NOT NULL DEFAULT 0;
             PRAGMA user_version = 2; COMMIT;").map_err(e)?;
     }
+    if v < 3 {
+        // A move is two rows that share pair_id (= the id of its outgoing row). Existing moves are paired once, here.
+        c.execute_batch("BEGIN; ALTER TABLE tx ADD COLUMN pair_id INTEGER; CREATE INDEX tx_pair ON tx(pair_id);").map_err(e)?;
+        let outs: Vec<(i64, i64, i64)> = {
+            let mut st = c.prepare("SELECT id,at,amount_cents FROM tx WHERE is_transfer=1 AND amount_cents<0 ORDER BY id").map_err(e)?;
+            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(e)?;
+            let v = rows.collect::<Result<Vec<_>, _>>().map_err(e)?;
+            v
+        };
+        for (id, at, amt) in outs {
+            let n = c.execute("UPDATE tx SET pair_id=?1 WHERE id=(SELECT id FROM tx WHERE is_transfer=1 AND pair_id IS NULL AND at=?2 AND amount_cents=?3 ORDER BY id LIMIT 1)", params![id, at, -amt]).map_err(e)?;
+            if n == 1 { c.execute("UPDATE tx SET pair_id=?1 WHERE id=?1", [id]).map_err(e)?; }
+        }
+        c.execute_batch("PRAGMA user_version = 3; COMMIT;").map_err(e)?;
+    }
     Ok(())
 }
 /// Opens the active profile's encrypted personal.db (SQLCipher raw key).
@@ -99,7 +116,7 @@ fn db(a: &App) -> R<Connection> {
     Ok(c)
 }
 
-// ---- App config (config/app.json: theme, accent, animation, last profile). Not sensitive. ----
+// ---- App config (config/app.json: theme, accent, animation, last profile, auto-lock). Not sensitive. ----
 #[tauri::command]
 fn cfg_get(a: State<App>) -> Value {
     fs::read(a.root.join("config/app.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(serde_json::json!({}))
@@ -132,7 +149,7 @@ fn create_profile(a: State<App>, name: String, password: Option<String>, modules
     let d = pdir(&a, &id)?;
     fs::create_dir_all(&d).map_err(e)?;
     if lock.is_none() { entry(&id)?.set_password(&hex(&dek)).map_err(e)?; } // no password: key lives in Windows Credential Manager
-    save_meta(&d, &Meta { id: id.clone(), name, modules, lock })?;
+    save_meta(&d, &Meta { id: id.clone(), name, modules, lock, currency: d_cur(), week_start: d_week() })?;
     Ok(Created { id, recovery: rec })
 }
 #[tauri::command]
@@ -148,7 +165,7 @@ fn open_profile(a: State<App>, id: String, password: Option<String>) -> R<Opened
     };
     *a.s.lock().map_err(e)? = Some(Session { id, dek, dir: d });
     db(&a)?; // creates / migrates personal.db
-    Ok(Opened { name: m.name, modules: m.modules, locked: m.lock.is_some() })
+    Ok(Opened { name: m.name, modules: m.modules, locked: m.lock.is_some(), currency: m.currency, week_start: m.week_start })
 }
 #[tauri::command]
 fn lock_now(a: State<App>) { if let Ok(mut g) = a.s.lock() { *g = None; } }
@@ -189,6 +206,113 @@ fn set_module(a: State<App>, name: String, on: bool) -> R<()> {
     match name.as_str() { "github" => m.modules.github = on, "commissions" => m.modules.commissions = on, _ => return Err("Unknown module".into()) }
     save_meta(&s.dir, &m)
 }
+/// Renames any profile (the name is only a label, the folder stays named by its UUID).
+#[tauri::command]
+fn rename_profile(a: State<App>, id: String, name: String) -> R<()> {
+    let name = name.trim().to_string();
+    if name.is_empty() || name.chars().count() > 40 { return Err("Enter a profile name (up to 40 characters)".into()); }
+    let d = pdir(&a, &id)?;
+    let mut m = read_meta(&d)?;
+    m.name = name;
+    save_meta(&d, &m)
+}
+const CURS: [&str; 9] = ["USD", "EUR", "GBP", "JPY", "IDR", "SGD", "MYR", "AUD", "CAD"];
+/// Currency and week start of the active profile (stored in its profile.json). Amounts are not converted.
+#[tauri::command]
+fn set_prefs(a: State<App>, currency: String, week_start: u8) -> R<()> {
+    if !CURS.contains(&currency.as_str()) { return Err("Unknown currency".into()); }
+    if week_start > 1 { return Err("Unknown week start".into()); }
+    let g = a.s.lock().map_err(e)?; let s = g.as_ref().ok_or("Profile is locked")?;
+    let mut m = read_meta(&s.dir)?;
+    m.currency = currency; m.week_start = week_start;
+    save_meta(&s.dir, &m)
+}
+#[tauri::command]
+fn about_info(a: State<App>) -> Value {
+    serde_json::json!({ "version": env!("CARGO_PKG_VERSION"), "path": a.root.to_string_lossy().to_string() })
+}
+
+// ---- Backup: one file holding the encrypted data plus the data key, sealed with a backup password ----
+#[derive(Serialize, Deserialize)]
+struct Bak { v: u8, name: String, modules: Mods, currency: String, week_start: u8, salt: String, blob: String }
+#[derive(Serialize, Deserialize)]
+struct BakData { dek: String, db: String, dash: Option<String> }
+#[derive(Serialize)] struct BakInfo { file: String, name: String, at: u64, size: u64 }
+
+/// UTC date as YYYY-MM-DD from unix seconds.
+fn ymd(secs: u64) -> String {
+    let z = (secs / 86400) as i64 + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    format!("{:04}-{:02}-{:02}", yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d)
+}
+#[tauri::command]
+fn export_backup(a: State<App>, password: String) -> R<String> {
+    if password.chars().count() < 6 { return Err("Use at least 6 characters for the backup password".into()); }
+    let (dir, dek) = { let g = a.s.lock().map_err(e)?; let s = g.as_ref().ok_or("Profile is locked")?; (s.dir.clone(), s.dek) };
+    let m = read_meta(&dir)?;
+    let data = BakData {
+        dek: hex(&dek),
+        db: b64(&fs::read(dir.join("personal.db")).map_err(e)?),
+        dash: fs::read(dir.join("dashboard.json")).ok().map(|b| b64(&b)),
+    };
+    let salt = rnd::<16>();
+    let blob = seal(&kdf(password.as_bytes(), &salt)?, &serde_json::to_vec(&data).map_err(e)?)?;
+    let bak = Bak { v: 1, name: m.name.clone(), modules: m.modules, currency: m.currency.clone(), week_start: m.week_start, salt: b64(&salt), blob: b64(&blob) };
+    let d = a.root.join("backups"); fs::create_dir_all(&d).map_err(e)?;
+    let safe: String = m.name.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map_err(e)?.as_secs();
+    let f = d.join(format!("{}-{}-{:02}{:02}.deqbackup", safe, ymd(secs), secs % 86400 / 3600, secs % 3600 / 60));
+    if f.exists() { return Err("A backup was already saved this minute. Try again in a minute".into()); }
+    write_atomic(&f, &serde_json::to_vec(&bak).map_err(e)?)?;
+    Ok(f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default())
+}
+#[tauri::command]
+fn list_backups(a: State<App>) -> Vec<BakInfo> {
+    let mut v: Vec<BakInfo> = fs::read_dir(a.root.join("backups")).into_iter().flatten().flatten()
+        .filter(|d| d.path().extension().map_or(false, |x| x == "deqbackup"))
+        .filter_map(|d| {
+            let md = d.metadata().ok()?;
+            let b: Bak = serde_json::from_slice(&fs::read(d.path()).ok()?).ok()?;
+            Some(BakInfo { file: d.file_name().to_string_lossy().to_string(), name: b.name, at: md.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_secs(), size: md.len() })
+        }).collect();
+    v.sort_by(|x, y| y.at.cmp(&x.at));
+    v
+}
+/// Restores a backup as a NEW profile (new UUID). An optional password protects it and issues a recovery key.
+#[tauri::command]
+fn import_backup(a: State<App>, file: String, backup_password: String, password: Option<String>) -> R<Created> {
+    if file.contains('/') || file.contains('\\') || file.contains("..") || !file.ends_with(".deqbackup") { return Err("Bad backup file".into()); }
+    let bak: Bak = serde_json::from_slice(&fs::read(a.root.join("backups").join(&file)).map_err(e)?).map_err(|_| "This is not a Deq backup".to_string())?;
+    if bak.v != 1 { return Err("This backup was made by a newer Deq".into()); }
+    let raw = open(&kdf(backup_password.as_bytes(), &unb(&bak.salt)?)?, &unb(&bak.blob)?).map_err(|_| "Wrong backup password".to_string())?;
+    let data: BakData = serde_json::from_slice(&raw).map_err(|_| "Corrupt backup".to_string())?;
+    let dek = unhex(&data.dek).ok_or("Corrupt backup")?;
+    let (lock, rec) = match password.filter(|p| !p.is_empty()) {
+        Some(p) => { let (l, r) = make_lock(&dek, &p)?; (Some(l), Some(r)) }
+        None => (None, None),
+    };
+    let id = uuid::Uuid::new_v4().to_string();
+    let d = pdir(&a, &id)?;
+    fs::create_dir_all(&d).map_err(e)?;
+    let put = || -> R<()> {
+        fs::write(d.join("personal.db"), unb(&data.db)?).map_err(e)?;
+        if let Some(x) = &data.dash { write_atomic(&d.join("dashboard.json"), &unb(x)?)?; }
+        if lock.is_none() { entry(&id)?.set_password(&hex(&dek)).map_err(e)?; }
+        save_meta(&d, &Meta { id: id.clone(), name: format!("{} (imported)", bak.name), modules: bak.modules, lock: lock.clone(), currency: bak.currency.clone(), week_start: bak.week_start })
+    };
+    if let Err(x) = put() { // leave nothing half-restored
+        let _ = fs::remove_dir_all(&d);
+        let _ = entry(&id).and_then(|en| en.delete_credential().map_err(e));
+        return Err(x);
+    }
+    Ok(Created { id, recovery: rec })
+}
 
 // ---- dashboard.json (encrypted with the profile key) ----
 #[tauri::command]
@@ -208,26 +332,66 @@ fn dashboard_set(a: State<App>, json: String) -> R<()> {
 // ---- Personal ----
 #[tauri::command]
 fn add_time(a: State<App>, project: String, start: i64, end: i64) -> R<()> {
+    let project = project.trim().to_string();
+    if project.is_empty() { return Err("Enter a project name".into()); }
+    if end <= start { return Err("End time must be after the start".into()); }
     db(&a)?.execute("INSERT INTO time_entries(project,start_ts,end_ts) VALUES(?1,?2,?3)", params![project, start, end]).map_err(e)?; Ok(())
+}
+#[tauri::command]
+fn update_time(a: State<App>, id: i64, project: String, start: i64, end: i64) -> R<()> {
+    let project = project.trim().to_string();
+    if project.is_empty() { return Err("Enter a project name".into()); }
+    if end <= start { return Err("End time must be after the start".into()); }
+    let n = db(&a)?.execute("UPDATE time_entries SET project=?1,start_ts=?2,end_ts=?3 WHERE id=?4", params![project, start, end, id]).map_err(e)?;
+    if n == 0 { return Err("Time entry not found".into()); }
+    Ok(())
 }
 #[tauri::command]
 fn add_account(a: State<App>, name: String, kind: String, opening_cents: i64) -> R<()> {
     db(&a)?.execute("INSERT INTO accounts(name,kind,opening_cents) VALUES(?1,?2,?3)", params![name, kind, opening_cents]).map_err(e)?; Ok(())
 }
 #[tauri::command]
+fn update_account(a: State<App>, id: i64, name: String, kind: String, opening_cents: i64) -> R<()> {
+    let name = name.trim().to_string();
+    if name.is_empty() { return Err("Enter an account name".into()); }
+    if kind != "Bank" && kind != "Wallet" { return Err("Unknown account type".into()); }
+    let n = db(&a)?.execute("UPDATE accounts SET name=?1,kind=?2,opening_cents=?3 WHERE id=?4", params![name, kind, opening_cents, id]).map_err(e)?;
+    if n == 0 { return Err("Account not found".into()); }
+    Ok(())
+}
+#[tauri::command]
 fn add_tx(a: State<App>, account_id: i64, amount_cents: i64, note: String, at: i64, category: Option<String>) -> R<()> {
     let cat = category.map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
     db(&a)?.execute("INSERT INTO tx(account_id,amount_cents,note,at,category) VALUES(?1,?2,?3,?4,?5)", params![account_id, amount_cents, note, at, cat]).map_err(e)?; Ok(())
 }
+/// Edits a transaction. For a move, the amount (as a positive number), note and date change on BOTH sides; its accounts stay.
+#[tauri::command]
+fn update_tx(a: State<App>, id: i64, account_id: i64, amount_cents: i64, note: String, at: i64, category: Option<String>) -> R<()> {
+    let mut c = db(&a)?;
+    let t = c.transaction().map_err(e)?;
+    let (tr, pair, old): (i64, Option<i64>, i64) = t.query_row("SELECT is_transfer,pair_id,amount_cents FROM tx WHERE id=?1", [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(|_| "Transaction not found".to_string())?;
+    if tr == 1 {
+        let m = amount_cents.abs();
+        if m == 0 { return Err("Enter an amount above zero".into()); }
+        match pair {
+            Some(p) => { t.execute("UPDATE tx SET amount_cents=CASE WHEN amount_cents<0 THEN -?1 ELSE ?1 END, note=?2, at=?3 WHERE pair_id=?4", params![m, note, at, p]).map_err(e)?; }
+            None => { t.execute("UPDATE tx SET amount_cents=?1, note=?2, at=?3 WHERE id=?4", params![if old < 0 { -m } else { m }, note, at, id]).map_err(e)?; }
+        }
+    } else {
+        let cat = category.map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
+        t.execute("UPDATE tx SET account_id=?1, amount_cents=?2, note=?3, at=?4, category=?5 WHERE id=?6", params![account_id, amount_cents, note, at, cat, id]).map_err(e)?;
+    }
+    t.commit().map_err(e)
+}
 #[tauri::command]
 fn list_accounts(a: State<App>) -> R<Vec<Acc>> {
     let c = db(&a)?;
-    let mut st = c.prepare("SELECT a.id,a.name,a.kind,a.opening_cents+COALESCE((SELECT SUM(amount_cents) FROM tx WHERE account_id=a.id),0) FROM accounts a ORDER BY a.name").map_err(e)?;
-    let rows = st.query_map([], |r| Ok(Acc { id: r.get(0)?, name: r.get(1)?, kind: r.get(2)?, balance_cents: r.get(3)? })).map_err(e)?;
+    let mut st = c.prepare("SELECT a.id,a.name,a.kind,a.opening_cents+COALESCE((SELECT SUM(amount_cents) FROM tx WHERE account_id=a.id),0),a.opening_cents FROM accounts a ORDER BY a.name").map_err(e)?;
+    let rows = st.query_map([], |r| Ok(Acc { id: r.get(0)?, name: r.get(1)?, kind: r.get(2)?, balance_cents: r.get(3)?, opening_cents: r.get(4)? })).map_err(e)?;
     let v = rows.collect::<Result<Vec<_>, _>>().map_err(e)?;
     Ok(v)
 }
-/// week_start = unix seconds of local Monday 00:00. Returns seconds tracked per day, Mon..Sun.
+/// week_start = unix seconds of the local first day of the week 00:00. Returns seconds tracked per day, first day first.
 #[tauri::command]
 fn stats(a: State<App>, week_start: i64) -> R<Stats> {
     let c = db(&a)?;
@@ -240,15 +404,20 @@ fn stats(a: State<App>, week_start: i64) -> R<Stats> {
     Ok(Stats { balance_cents, week })
 }
 
-#[derive(Serialize)] struct TxRow { id: i64, account: String, amount_cents: i64, note: String, at: i64, category: String, transfer: bool }
+#[derive(Serialize)] struct TxRow { id: i64, account_id: i64, account: String, amount_cents: i64, note: String, at: i64, category: String, transfer: bool }
 #[derive(Serialize)] struct TimeRow { id: i64, project: String, start: i64, end: i64 }
 #[derive(Serialize)] struct Summary { spent_cents: i64, income_cents: i64 }
+
+const TX_SELECT: &str = "SELECT t.id,t.account_id,a.name,t.amount_cents,COALESCE(t.note,''),t.at,COALESCE(t.category,''),t.is_transfer FROM tx t JOIN accounts a ON a.id=t.account_id";
+fn tx_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TxRow> {
+    Ok(TxRow { id: r.get(0)?, account_id: r.get(1)?, account: r.get(2)?, amount_cents: r.get(3)?, note: r.get(4)?, at: r.get(5)?, category: r.get(6)?, transfer: r.get::<_, i64>(7)? != 0 })
+}
 
 #[tauri::command]
 fn list_tx(a: State<App>, limit: i64) -> R<Vec<TxRow>> {
     let c = db(&a)?;
-    let mut st = c.prepare("SELECT t.id,a.name,t.amount_cents,COALESCE(t.note,''),t.at,COALESCE(t.category,''),t.is_transfer FROM tx t JOIN accounts a ON a.id=t.account_id ORDER BY t.at DESC,t.id DESC LIMIT ?1").map_err(e)?;
-    let rows = st.query_map([limit], |r| Ok(TxRow { id: r.get(0)?, account: r.get(1)?, amount_cents: r.get(2)?, note: r.get(3)?, at: r.get(4)?, category: r.get(5)?, transfer: r.get::<_, i64>(6)? != 0 })).map_err(e)?;
+    let mut st = c.prepare(&format!("{TX_SELECT} ORDER BY t.at DESC,t.id DESC LIMIT ?1")).map_err(e)?;
+    let rows = st.query_map([limit], tx_row).map_err(e)?;
     let v = rows.collect::<Result<Vec<_>, _>>().map_err(e)?;
     Ok(v)
 }
@@ -272,15 +441,16 @@ fn spend_summary(a: State<App>, from: i64) -> R<Summary> {
 #[tauri::command]
 fn list_tx_range(a: State<App>, from: i64, to: i64) -> R<Vec<TxRow>> {
     let c = db(&a)?;
-    let mut st = c.prepare("SELECT t.id,a.name,t.amount_cents,COALESCE(t.note,''),t.at,COALESCE(t.category,''),t.is_transfer FROM tx t JOIN accounts a ON a.id=t.account_id WHERE t.at>=?1 AND t.at<?2 ORDER BY t.at DESC,t.id DESC").map_err(e)?;
-    let rows = st.query_map(params![from, to], |r| Ok(TxRow { id: r.get(0)?, account: r.get(1)?, amount_cents: r.get(2)?, note: r.get(3)?, at: r.get(4)?, category: r.get(5)?, transfer: r.get::<_, i64>(6)? != 0 })).map_err(e)?;
+    let mut st = c.prepare(&format!("{TX_SELECT} WHERE t.at>=?1 AND t.at<?2 ORDER BY t.at DESC,t.id DESC")).map_err(e)?;
+    let rows = st.query_map(params![from, to], tx_row).map_err(e)?;
     let v = rows.collect::<Result<Vec<_>, _>>().map_err(e)?;
     Ok(v)
 }
+/// Entries that overlap [from, to), so one that crosses midnight shows on both days.
 #[tauri::command]
 fn list_time_range(a: State<App>, from: i64, to: i64) -> R<Vec<TimeRow>> {
     let c = db(&a)?;
-    let mut st = c.prepare("SELECT id,project,start_ts,end_ts FROM time_entries WHERE start_ts>=?1 AND start_ts<?2 ORDER BY start_ts DESC").map_err(e)?;
+    let mut st = c.prepare("SELECT id,project,start_ts,end_ts FROM time_entries WHERE end_ts>?1 AND start_ts<?2 ORDER BY start_ts DESC").map_err(e)?;
     let rows = st.query_map(params![from, to], |r| Ok(TimeRow { id: r.get(0)?, project: r.get(1)?, start: r.get(2)?, end: r.get(3)? })).map_err(e)?;
     let v = rows.collect::<Result<Vec<_>, _>>().map_err(e)?;
     Ok(v)
@@ -326,7 +496,9 @@ fn add_transfer(a: State<App>, from_id: i64, to_id: i64, amount_cents: i64, note
     let mut c = db(&a)?;
     let t = c.transaction().map_err(e)?;
     t.execute("INSERT INTO tx(account_id,amount_cents,note,at,is_transfer) VALUES(?1,?2,?3,?4,1)", params![from_id, -amount_cents, note, at]).map_err(e)?;
-    t.execute("INSERT INTO tx(account_id,amount_cents,note,at,is_transfer) VALUES(?1,?2,?3,?4,1)", params![to_id, amount_cents, note, at]).map_err(e)?;
+    let oid = t.last_insert_rowid(); // the outgoing row's id becomes the pair id of both halves
+    t.execute("UPDATE tx SET pair_id=?1 WHERE id=?1", [oid]).map_err(e)?;
+    t.execute("INSERT INTO tx(account_id,amount_cents,note,at,is_transfer,pair_id) VALUES(?1,?2,?3,?4,1,?5)", params![to_id, amount_cents, note, at, oid]).map_err(e)?;
     t.commit().map_err(e)
 }
 /// Income and outcome in [from, to). Transfers between your own accounts are not counted.
@@ -356,11 +528,11 @@ fn list_categories(a: State<App>) -> R<Vec<String>> {
 fn delete_tx(a: State<App>, id: i64) -> R<()> {
     let mut c = db(&a)?;
     let t = c.transaction().map_err(e)?;
-    let (amt, at, tr): (i64, i64, i64) = t.query_row("SELECT amount_cents,at,is_transfer FROM tx WHERE id=?1", [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(|_| "Transaction not found".to_string())?;
-    t.execute("DELETE FROM tx WHERE id=?1", [id]).map_err(e)?;
-    if tr == 1 { // a move is stored as two rows, so remove the other half too
-        t.execute("DELETE FROM tx WHERE id=(SELECT id FROM tx WHERE is_transfer=1 AND at=?1 AND amount_cents=?2 LIMIT 1)", params![at, -amt]).map_err(e)?;
-    }
+    let pair: Option<i64> = t.query_row("SELECT pair_id FROM tx WHERE id=?1", [id], |r| r.get(0)).map_err(|_| "Transaction not found".to_string())?;
+    match pair {
+        Some(p) => t.execute("DELETE FROM tx WHERE pair_id=?1", [p]).map_err(e)?, // a move is two rows that share a pair id
+        None => t.execute("DELETE FROM tx WHERE id=?1", [id]).map_err(e)?,
+    };
     t.commit().map_err(e)
 }
 #[tauri::command]
@@ -373,7 +545,7 @@ fn delete_account(a: State<App>, id: i64) -> R<()> {
     let mut c = db(&a)?;
     let t = c.transaction().map_err(e)?;
     // the other half of a move stays in its account, as a normal transaction
-    t.execute("UPDATE tx SET is_transfer=0 WHERE is_transfer=1 AND account_id<>?1 AND EXISTS (SELECT 1 FROM tx o WHERE o.account_id=?1 AND o.is_transfer=1 AND o.at=tx.at AND o.amount_cents=-tx.amount_cents)", [id]).map_err(e)?;
+    t.execute("UPDATE tx SET is_transfer=0, pair_id=NULL WHERE account_id<>?1 AND pair_id IN (SELECT pair_id FROM tx WHERE account_id=?1 AND pair_id IS NOT NULL)", [id]).map_err(e)?;
     let n = t.execute("DELETE FROM accounts WHERE id=?1", [id]).map_err(e)?; // its transactions go with it (ON DELETE CASCADE)
     if n == 0 { return Err("Account not found".into()); }
     t.commit().map_err(e)
@@ -383,7 +555,7 @@ fn main() {
     let _ = fs::create_dir_all(root.join("user"));
     tauri::Builder::default()
         .manage(App { root, s: Mutex::new(None) })
-        .invoke_handler(tauri::generate_handler![cfg_get, cfg_set, profiles, create_profile, open_profile, lock_now, set_password, remove_password, recover, set_module, dashboard_get, dashboard_set, add_time, add_account, add_tx, list_accounts, stats, list_tx, list_time, spend_summary, list_tx_range, list_time_range, project_totals, spend_by_account, delete_profile, spend_by_category, finance_sum, list_categories, add_transfer, delete_tx, delete_time, delete_account])
+        .invoke_handler(tauri::generate_handler![cfg_get, cfg_set, profiles, create_profile, open_profile, lock_now, set_password, remove_password, recover, set_module, dashboard_get, dashboard_set, add_time, add_account, add_tx, list_accounts, stats, list_tx, list_time, spend_summary, list_tx_range, list_time_range, project_totals, spend_by_account, delete_profile, spend_by_category, finance_sum, list_categories, add_transfer, delete_tx, delete_time, delete_account, rename_profile, set_prefs, about_info, export_backup, list_backups, import_backup, update_tx, update_account, update_time])
         .run(tauri::generate_context!())
         .expect("failed to start Deq");
 }
