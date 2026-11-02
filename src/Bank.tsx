@@ -11,6 +11,7 @@ export default function Bank(){
   const toast=useToast();
   const [view,setView]=useState<Kind>('Bank');
   const [dlg,setDlg]=useState<''|'account'|'tx'|'move'>('');
+  const [ea,setEa]=useState<Acc|null>(null); // account being edited
   const [accs,setAccs]=useState<Acc[]>([]);
   const [txs,setTxs]=useState<TxRow[]>([]);
   const [sum,setSum]=useState<Summary|null>(null);
@@ -34,7 +35,7 @@ export default function Bank(){
   const total=shown.reduce((n,a)=>n+a.balance_cents,0);
   const when=(v:Record<string,string>)=>v.date?Math.floor(new Date(v.date+'T12:00:00').getTime()/1000):now();
   const word=view==='Bank'?'bank account':'e-wallet';
-  const acct=(a:Acc)=><RemoveBtn what={view==='Bank'?'Account':'E-wallet'} hint={`This removes “${a.name}” and its transactions. Money you moved to or from it stays in the other account. This can’t be undone.`} onRemove={()=>api.delAccount(a.id).then(()=>load())}/>;
+  const acct=(a:Acc)=><div className="acts"><button className="btn o sm" onClick={()=>setEa(a)}>Edit</button><RemoveBtn what={view==='Bank'?'Account':'E-wallet'} hint={`This removes “${a.name}” and its transactions. Money you moved to or from it stays in the other account. This can’t be undone.`} onRemove={()=>api.delAccount(a.id).then(()=>load())}/></div>;
 
   return <div className="fit">
     <header>
@@ -75,6 +76,16 @@ export default function Bank(){
         <label>Type<select name="kind" defaultValue={view}><option value="Bank">Bank</option><option value="Wallet">E-wallet</option></select></label>
         <label>Opening balance<input name="opening" type="number" step="0.01" defaultValue="0"/></label>
         <Actions ok="Add" onClose={close}/>
+      </form>
+    </Dialog>}
+
+    {ea&&<Dialog title="Edit account" onClose={()=>setEa(null)}>
+      <form className="stack" onSubmit={sub('Account updated',v=>api.updateAccount(ea.id,v.name,v.kind,cents(v.opening)).then(()=>setEa(null)))}>
+        <label>Name<input name="name" defaultValue={ea.name} required/></label>
+        <label>Type<select name="kind" defaultValue={ea.kind}><option value="Bank">Bank</option><option value="Wallet">E-wallet</option></select></label>
+        <label>Opening balance<input name="opening" type="number" step="0.01" defaultValue={(ea.opening_cents/100).toFixed(2)}/></label>
+        <p className="note" style={{margin:0}}>The balance is this opening amount plus all of the account’s transactions, so changing it changes the balance.</p>
+        <Actions ok="Save changes" onClose={()=>setEa(null)}/>
       </form>
     </Dialog>}
 
